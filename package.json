@@ -1,0 +1,15 @@
+{
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "nodemon": "^3.1.10",
+    "pg": "^8.16.3",
+    "react-router-dom": "^7.9.4",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.1"
+  },
+  "devDependencies": {
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^7.0.1"
+  }
+}
