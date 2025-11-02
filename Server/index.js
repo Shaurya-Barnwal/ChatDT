@@ -1,4 +1,6 @@
+// Server/index.js
 require('dotenv').config();
+
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -6,7 +8,6 @@ const cors = require('cors');
 const { Pool } = require('pg');
 
 const app = express();
-const cors = require('cors');
 
 // allow origins from env (comma-separated), default to * in dev
 const allowed = process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : ['*'];
@@ -34,20 +35,27 @@ const io = new Server(server, {
   },
 });
 
-
+// Postgres pool
 const pool = new Pool({ connectionString: process.env.DATABASE_URL || 'postgres://postgres:pass@localhost:5432/chat' });
 
+// Simple health endpoint
+app.get('/', (req, res) => {
+  res.json({ ok: true, timestamp: new Date().toISOString() });
+});
+
+// Create room endpoint
 app.post('/create-room', async (req, res) => {
   const { room_name } = req.body;
   try {
     const result = await pool.query('INSERT INTO rooms(room_name) VALUES($1) RETURNING id', [room_name || null]);
     res.json({ roomId: result.rows[0].id });
   } catch (err) {
-    console.error(err);
+    console.error('create-room error', err);
     res.status(500).json({ error: 'db error' });
   }
 });
 
+// Get recent messages (returns base64 ciphertext/iv)
 app.get('/rooms/:roomId/messages', async (req, res) => {
   const { roomId } = req.params;
   try {
@@ -64,11 +72,12 @@ app.get('/rooms/:roomId/messages', async (req, res) => {
     }));
     res.json(rows);
   } catch (err) {
-    console.error(err);
+    console.error('get messages error', err);
     res.status(500).json({ error: 'db error' });
   }
 });
 
+// Socket.IO handlers
 io.on('connection', socket => {
   console.log('socket connected', socket.id);
 
@@ -98,7 +107,7 @@ io.on('connection', socket => {
       await pool.query('UPDATE messages SET status=$1, delivered_at=COALESCE(delivered_at, now()) WHERE message_id=$2', ['delivered', messageId]);
       io.emit('message-status-update', { messageId, status: 'delivered', ts: new Date().toISOString() });
     } catch (err) {
-      console.error(err);
+      console.error('message-received error', err);
     }
   });
 
@@ -107,7 +116,7 @@ io.on('connection', socket => {
       await pool.query('UPDATE messages SET status=$1, read_at=COALESCE(read_at, now()) WHERE message_id=$2', ['read', messageId]);
       io.emit('message-status-update', { messageId, status: 'read', ts: new Date().toISOString() });
     } catch (err) {
-      console.error(err);
+      console.error('message-read error', err);
     }
   });
 
