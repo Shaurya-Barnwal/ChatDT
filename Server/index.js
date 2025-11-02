@@ -6,13 +6,34 @@ const cors = require('cors');
 const { Pool } = require('pg');
 
 const app = express();
-app.use(cors());
+const cors = require('cors');
+
+// allow origins from env (comma-separated), default to * in dev
+const allowed = process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : ['*'];
+app.use(cors({
+  origin: function (origin, callback) {
+    // allow requests with no origin (like curl/postman)
+    if (!origin) return callback(null, true);
+    if (allowed.includes('*')) return callback(null, true);
+    if (!allowed.includes(origin)) {
+      const msg = 'CORS: access denied for origin ' + origin;
+      return callback(new Error(msg), false);
+    }
+    return callback(null, true);
+  },
+}));
+
 app.use(express.json());
 
+// create HTTP + WebSocket server
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: '*' }
+  cors: {
+    origin: allowed.includes('*') ? '*' : allowed,
+    methods: ['GET', 'POST'],
+  },
 });
+
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL || 'postgres://postgres:pass@localhost:5432/chat' });
 
