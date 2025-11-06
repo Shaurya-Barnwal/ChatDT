@@ -1,7 +1,7 @@
 import React from 'react';
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
-import Landing from './pages/Landing';
-import Chat from './pages/Chat';
+import Landing from "./pages/Landing.jsx";
+import Chat from "./pages/Chat.jsx";
 
 export default function App() {
   return (
