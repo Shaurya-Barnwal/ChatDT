@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { useParams } from 'react-router-dom';
 import io from 'socket.io-client';
-import { deriveKey, encryptText, decryptText } from '../utils/crypto';
+import { deriveKey, encryptText, decryptText } from "../utils/crypto.js";
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:4000';
 let socket; // module-scoped, used by send()
