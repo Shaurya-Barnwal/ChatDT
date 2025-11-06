@@ -2,3 +2,7 @@
 Server/.env
 web/.env
 
+.env
+Server/.env
+web/.env
+
