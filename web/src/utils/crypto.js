@@ -60,3 +60,4 @@ export async function decryptText(key, ivBase64, ciphertextBase64) {
   const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
   return dec.decode(plaintext);
 }
+export { deriveKey, encryptText, decryptText };
