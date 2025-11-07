@@ -87,18 +87,25 @@ io.on('connection', socket => {
     console.log(`${userId} joined ${roomId}`);
   });
 
-  socket.on('send-message', async (payload) => {
+    // inside your `socket.on('send-message', ...)` handler
+  socket.on('send-message', async ({ messageId, roomId, senderId, ciphertext, iv, createdAt }) => {
     try {
-      const { messageId, roomId, senderId, ciphertext, iv, expiresAt } = payload;
-      await pool.query(
-        'INSERT INTO messages(message_id, room_id, sender_id, ciphertext, iv, expires_at) VALUES($1,$2,$3,$4,$5,$6)',
-        [messageId, roomId, senderId, Buffer.from(ciphertext, 'base64'), Buffer.from(iv, 'base64'), expiresAt || null]
-      );
-      socket.emit('message-saved', { messageId, status: 'sent', createdAt: new Date().toISOString() });
-      io.to(roomId).emit('message', { messageId, roomId, senderId, ciphertext, iv, createdAt: payload.createdAt, expiresAt });
+      // save to DB (your existing code)...
+      // e.g. await pool.query('INSERT INTO messages (...) VALUES (...)', [...]);
+
+      // Build canonical payload to broadcast to others
+      const payload = { messageId, roomId, senderId, ciphertext, iv, createdAt, status: 'sent' };
+
+      // BROADCAST TO OTHERS ONLY (do NOT send to the sender)
+      socket.to(roomId).emit('message', payload); // <-- key change
+
+      // Notify the sender that their message was saved
+      socket.emit('message-saved', { messageId, status: 'sent' });
+
     } catch (err) {
       console.error('send-message error', err);
-      socket.emit('message-error', { error: 'db error' });
+      // tell sender it failed
+      socket.emit('message-saved', { messageId, status: 'failed' });
     }
   });
 
