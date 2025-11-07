@@ -13,20 +13,46 @@ export default function Chat() {
   const [key, setKey] = useState(null);
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
-  const [statusMap, setStatusMap] = useState({}); // messageId -> status
-  const userId = localStorage.getItem("userId") || window.crypto.randomUUID();
+  const [statusMap, setStatusMap] = useState({});
+
+  // username prompt state
+  const [showNamePrompt, setShowNamePrompt] = useState(false);
+  const [tempName, setTempName] = useState("");
+
+  const userId =
+    localStorage.getItem("userId") || window.crypto.randomUUID();
+
   const messagesRef = useRef([]);
   const listRef = useRef(null);
+
+  // keep userId in localStorage if newly generated
+  useEffect(() => {
+    if (!localStorage.getItem("userId")) {
+      localStorage.setItem("userId", userId);
+    }
+  }, [userId]);
+
+  // check username
+  useEffect(() => {
+    if (!localStorage.getItem("username")) {
+      setShowNamePrompt(true);
+    }
+  }, []);
+
+  const submitName = () => {
+    const nameToUse = tempName.trim() || "Anon";
+    localStorage.setItem("username", nameToUse);
+    setShowNamePrompt(false);
+  };
 
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
 
-  // auto-scroll to bottom on new messages
+  // auto-scroll when new messages arrive
   useEffect(() => {
     const el = listRef.current;
     if (!el) return;
-    // smooth scroll only if element already near bottom (otherwise user might be reading)
     const isNearBottom =
       el.scrollHeight - el.scrollTop - el.clientHeight < 200;
     if (isNearBottom) {
@@ -34,20 +60,21 @@ export default function Chat() {
     }
   }, [messages.length]);
 
-  // load previous messages
+  // load previous messages from DB
   useEffect(() => {
     if (!roomId) return;
     fetch(`${API}/rooms/${roomId}/messages`)
       .then((r) => r.json())
-      .then(async (data) => {
+      .then((data) => {
         setMessages(data.map((m) => ({ ...m })));
       })
       .catch(console.error);
   }, [roomId]);
 
-  // setup socket when key is ready
+  // socket setup — only after key + username ready
   useEffect(() => {
-    if (!roomId || !key) return;
+    if (!roomId || !key || showNamePrompt) return;
+
     socket = io(API, { transports: ["websocket", "polling"] });
 
     socket.on("connect", () => {
@@ -55,9 +82,11 @@ export default function Chat() {
     });
 
     socket.on("message", async (payload) => {
-      // add ciphertext message locally
       setMessages((prev) => [...prev, payload]);
-      socket.emit("message-received", { messageId: payload.messageId, userId });
+      socket.emit("message-received", {
+        messageId: payload.messageId,
+        userId,
+      });
 
       try {
         const pt = await decryptText(key, payload.iv, payload.ciphertext);
@@ -66,7 +95,10 @@ export default function Chat() {
             m.messageId === payload.messageId ? { ...m, plaintext: pt } : m
           )
         );
-        socket.emit("message-read", { messageId: payload.messageId, userId });
+        socket.emit("message-read", {
+          messageId: payload.messageId,
+          userId,
+        });
       } catch (err) {
         console.warn("decrypt failed", err);
       }
@@ -79,7 +111,9 @@ export default function Chat() {
     socket.on("message-status-update", ({ messageId, status }) => {
       setStatusMap((m) => ({ ...m, [messageId]: status }));
       setMessages((prev) =>
-        prev.map((msg) => (msg.messageId === messageId ? { ...msg, status } : msg))
+        prev.map((msg) =>
+          msg.messageId === messageId ? { ...msg, status } : msg
+        )
       );
     });
 
@@ -91,7 +125,7 @@ export default function Chat() {
       }
       socket = null;
     };
-  }, [key, roomId, userId]);
+  }, [key, roomId, userId, showNamePrompt]);
 
   const unlock = async () => {
     if (!passphrase) return alert("Enter passphrase");
@@ -102,6 +136,7 @@ export default function Chat() {
   const send = async () => {
     if (!text.trim()) return;
     if (!key) return alert("Unlock with passphrase first");
+
     const messageId = window.crypto.randomUUID();
     const createdAt = new Date().toISOString();
     const { iv, ciphertext } = await encryptText(key, text);
@@ -116,7 +151,7 @@ export default function Chat() {
       plaintext: text,
       status: "sending",
     };
-    setMessages((prev) => [...prev, msg]);
+    setMessages((p) => [...p, msg]);
     setText("");
 
     socket.emit("send-message", {
@@ -129,9 +164,9 @@ export default function Chat() {
     });
   };
 
-  function renderTick(message) {
-    if (message.senderId !== userId) return null;
-    const status = statusMap[message.messageId] || message.status || "sent";
+  function renderTick(m) {
+    if (m.senderId !== userId) return null;
+    const status = statusMap[m.messageId] || m.status || "sent";
     if (status === "sending") return <span className="tick">…</span>;
     if (status === "sent") return <span className="tick">✓</span>;
     if (status === "delivered") return <span className="tick">✓✓</span>;
@@ -141,6 +176,70 @@ export default function Chat() {
 
   return (
     <div className="chat-page">
+
+      {/* ✅ YOUR EXACT USERNAME PROMPT BLOCK */}
+      {showNamePrompt && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.35)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 9999,
+          }}
+        >
+          <div
+            style={{
+              background: "white",
+              padding: 20,
+              borderRadius: 12,
+              width: 380,
+              boxShadow: "0 18px 60px rgba(12,15,20,0.2)",
+            }}
+          >
+            <h3 style={{ marginTop: 0 }}>Enter display name</h3>
+            <input
+              autoFocus
+              value={tempName}
+              onChange={(e) => setTempName(e.target.value)}
+              placeholder="Your name"
+              style={{ width: "100%", padding: 8, marginBottom: 12 }}
+            />
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "flex-end",
+                gap: 8,
+              }}
+            >
+              <button
+                onClick={() => {
+                  localStorage.setItem("username", "Anon");
+                  setShowNamePrompt(false);
+                }}
+              >
+                Continue as Anon
+              </button>
+
+              <button
+                onClick={submitName}
+                style={{
+                  background: "#2065ff",
+                  color: "#fff",
+                  border: "none",
+                  padding: "8px 12px",
+                  borderRadius: 8,
+                }}
+              >
+                Join
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <header className="chat-header">
         <h3>Private Room</h3>
         <p className="room-id">Room: {roomId}</p>
@@ -158,7 +257,7 @@ export default function Chat() {
             Unlock
           </button>
           <div className="hint">
-            Passphrase + Room ID unlock messages. This uses client-side encryption.
+            Passphrase + Room ID unlock messages via client-side encryption.
           </div>
         </div>
       ) : (
@@ -166,17 +265,24 @@ export default function Chat() {
           <div className="messages" ref={listRef}>
             {messages.map((m, idx) => {
               const mine = m.senderId === userId;
-              const textToShow = m.plaintext ?? "Encrypted message (unlock to view)";
+              const txt =
+                m.plaintext ?? "Encrypted message (unlock to view)";
               return (
                 <div
                   key={m.messageId || idx}
                   className={`msg-row ${mine ? "mine" : "theirs"}`}
                 >
-                  <div className={`bubble ${mine ? "bubble-mine" : "bubble-theirs"}`}>
-                    <div className="msg-text">{textToShow}</div>
+                  <div
+                    className={`bubble ${
+                      mine ? "bubble-mine" : "bubble-theirs"
+                    }`}
+                  >
+                    <div className="msg-text">{txt}</div>
                     <div className="msg-meta">
                       <div className="time">
-                        {m.createdAt ? new Date(m.createdAt).toLocaleTimeString() : ""}
+                        {m.createdAt
+                          ? new Date(m.createdAt).toLocaleTimeString()
+                          : ""}
                       </div>
                       <div className="tick-wrap">{renderTick(m)}</div>
                     </div>
@@ -199,6 +305,7 @@ export default function Chat() {
                 }
               }}
             />
+
             <button className="btn btn-send" onClick={send}>
               Send
             </button>
