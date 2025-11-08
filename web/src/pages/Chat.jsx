@@ -25,14 +25,12 @@ export default function Chat() {
   const messagesRef = useRef([]);
   const listRef = useRef(null);
 
-  // keep userId in localStorage if newly generated
   useEffect(() => {
     if (!localStorage.getItem("userId")) {
       localStorage.setItem("userId", userId);
     }
   }, [userId]);
 
-  // check username
   useEffect(() => {
     if (!localStorage.getItem("username")) {
       setShowNamePrompt(true);
@@ -60,7 +58,7 @@ export default function Chat() {
     }
   }, [messages.length]);
 
-  // load previous messages from DB
+  // load previous messages
   useEffect(() => {
     if (!roomId) return;
     fetch(`${API}/rooms/${roomId}/messages`)
@@ -71,14 +69,16 @@ export default function Chat() {
       .catch(console.error);
   }, [roomId]);
 
-  // socket setup — only after key + username ready
+  // socket setup
   useEffect(() => {
     if (!roomId || !key || showNamePrompt) return;
 
     socket = io(API, { transports: ["websocket", "polling"] });
 
     socket.on("connect", () => {
-      socket.emit("join", { roomId, userId });
+      const username = localStorage.getItem("username") || "Anon";
+      socket.emit("join-room", { roomId, userId, username });
+      console.log("joined room", roomId, "userId", userId, "username", username);
     });
 
     socket.on("message", async (payload) => {
@@ -145,6 +145,7 @@ export default function Chat() {
       messageId,
       roomId,
       senderId: userId,
+      username: localStorage.getItem("username") || "Anon",
       ciphertext,
       iv,
       createdAt,
@@ -154,10 +155,12 @@ export default function Chat() {
     setMessages((p) => [...p, msg]);
     setText("");
 
+    const username = localStorage.getItem("username") || "Anon";
     socket.emit("send-message", {
       messageId,
       roomId,
       senderId: userId,
+      username,
       ciphertext,
       iv,
       createdAt,
@@ -177,7 +180,7 @@ export default function Chat() {
   return (
     <div className="chat-page">
 
-      {/* ✅ YOUR EXACT USERNAME PROMPT BLOCK */}
+      {/* ✅ USERNAME PROMPT BLOCK */}
       {showNamePrompt && (
         <div
           style={{
@@ -247,14 +250,13 @@ export default function Chat() {
 
       {!key ? (
         <div className="unlock-panel">
-          {/* passphrase input */}
           <input
             className="input"
             placeholder="Enter passphrase"
             value={passphrase}
-            onChange={e => setPassphrase(e.target.value)}
-            onKeyDown={e => {
-              if (e.key === 'Enter') {
+            onChange={(e) => setPassphrase(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
                 e.preventDefault();
                 unlock();
               }
@@ -270,28 +272,41 @@ export default function Chat() {
       ) : (
         <>
           <div className="messages" ref={listRef}>
-            {messages.map((m, idx) => {
-              const mine = m.senderId === userId;
-              const txt =
-                m.plaintext ?? "Encrypted message (unlock to view)";
+            {messages.map((msg, idx) => {
+              const mine = msg.sender_id === userId || msg.senderId === userId;
+              const username = msg.username || "Anon";
+              const textToShow = msg.plaintext ?? "Encrypted message (unlock to view)";
+              const createdAt = msg.created_at || msg.createdAt;
+
               return (
                 <div
-                  key={m.messageId || idx}
+                  key={msg.message_id || msg.messageId || idx}
                   className={`msg-row ${mine ? "mine" : "theirs"}`}
                 >
                   <div
-                    className={`bubble ${
-                      mine ? "bubble-mine" : "bubble-theirs"
-                    }`}
+                    className={`bubble ${mine ? "bubble-mine" : "bubble-theirs"}`}
                   >
-                    <div className="msg-text">{txt}</div>
+                    {/* show username label only for others */}
+                    {!mine && (
+                      <div
+                        style={{
+                          fontSize: 12,
+                          opacity: 0.85,
+                          marginBottom: 6,
+                          fontWeight: 500,
+                        }}
+                      >
+                        {username}
+                      </div>
+                    )}
+                    <div className="msg-text">{textToShow}</div>
                     <div className="msg-meta">
                       <div className="time">
-                        {m.createdAt
-                          ? new Date(m.createdAt).toLocaleTimeString()
+                        {createdAt
+                          ? new Date(createdAt).toLocaleTimeString()
                           : ""}
                       </div>
-                      <div className="tick-wrap">{renderTick(m)}</div>
+                      <div className="tick-wrap">{renderTick(msg)}</div>
                     </div>
                   </div>
                 </div>
@@ -304,9 +319,9 @@ export default function Chat() {
               className="composer-input"
               placeholder="Type a message"
               value={text}
-              onChange={e => setText(e.target.value)}
-              onKeyDown={e => {
-                if (e.key === 'Enter' && !e.shiftKey) {
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
                   send();
                 }
