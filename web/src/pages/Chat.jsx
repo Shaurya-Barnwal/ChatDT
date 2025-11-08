@@ -19,8 +19,7 @@ export default function Chat() {
   const [showNamePrompt, setShowNamePrompt] = useState(false);
   const [tempName, setTempName] = useState("");
 
-  const userId =
-    localStorage.getItem("userId") || window.crypto.randomUUID();
+  const userId = localStorage.getItem("userId") || window.crypto.randomUUID();
 
   const messagesRef = useRef([]);
   const listRef = useRef(null);
@@ -51,8 +50,7 @@ export default function Chat() {
   useEffect(() => {
     const el = listRef.current;
     if (!el) return;
-    const isNearBottom =
-      el.scrollHeight - el.scrollTop - el.clientHeight < 200;
+    const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
     if (isNearBottom) {
       el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
     }
@@ -78,14 +76,32 @@ export default function Chat() {
     socket.on("connect", () => {
       const username = localStorage.getItem("username") || "Anon";
       socket.emit("join-room", { roomId, userId, username });
-      console.log("joined room", roomId, "userId", userId, "username", username);
+      console.log(
+        "joined room",
+        roomId,
+        "userId",
+        userId,
+        "username",
+        username
+      );
+    });
+
+    // save server-generated userId (if server issues one)
+    socket.on("user-id", ({ userId: serverUserId }) => {
+      if (serverUserId) {
+        localStorage.setItem("userId", serverUserId);
+        console.log("saved server-generated userId", serverUserId);
+      }
     });
 
     socket.on("message", async (payload) => {
       setMessages((prev) => [...prev, payload]);
+
+      // ACK delivered to server (now includes roomId)
       socket.emit("message-received", {
         messageId: payload.messageId,
         userId,
+        roomId,
       });
 
       try {
@@ -95,9 +111,12 @@ export default function Chat() {
             m.messageId === payload.messageId ? { ...m, plaintext: pt } : m
           )
         );
+
+        // ACK read to server (now includes roomId)
         socket.emit("message-read", {
           messageId: payload.messageId,
           userId,
+          roomId,
         });
       } catch (err) {
         console.warn("decrypt failed", err);
@@ -179,7 +198,6 @@ export default function Chat() {
 
   return (
     <div className="chat-page">
-
       {/* ✅ USERNAME PROMPT BLOCK */}
       {showNamePrompt && (
         <div
@@ -275,7 +293,8 @@ export default function Chat() {
             {messages.map((msg, idx) => {
               const mine = msg.sender_id === userId || msg.senderId === userId;
               const username = msg.username || "Anon";
-              const textToShow = msg.plaintext ?? "Encrypted message (unlock to view)";
+              const textToShow =
+                msg.plaintext ?? "Encrypted message (unlock to view)";
               const createdAt = msg.created_at || msg.createdAt;
 
               return (
@@ -284,7 +303,9 @@ export default function Chat() {
                   className={`msg-row ${mine ? "mine" : "theirs"}`}
                 >
                   <div
-                    className={`bubble ${mine ? "bubble-mine" : "bubble-theirs"}`}
+                    className={`bubble ${
+                      mine ? "bubble-mine" : "bubble-theirs"
+                    }`}
                   >
                     {/* show username label only for others */}
                     {!mine && (
