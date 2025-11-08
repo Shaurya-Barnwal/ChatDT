@@ -247,11 +247,18 @@ export default function Chat() {
 
       {!key ? (
         <div className="unlock-panel">
+          {/* passphrase input */}
           <input
             className="input"
             placeholder="Enter passphrase"
             value={passphrase}
-            onChange={(e) => setPassphrase(e.target.value)}
+            onChange={e => setPassphrase(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                unlock();
+              }
+            }}
           />
           <button className="btn" onClick={unlock}>
             Unlock
@@ -293,19 +300,18 @@ export default function Chat() {
           </div>
 
           <div className="composer">
-            <input
+            <textarea
               className="composer-input"
-              value={text}
-              onChange={(e) => setText(e.target.value)}
               placeholder="Type a message"
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
+              value={text}
+              onChange={e => setText(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
                   send();
                 }
               }}
             />
-
             <button className="btn btn-send" onClick={send}>
               Send
             </button>

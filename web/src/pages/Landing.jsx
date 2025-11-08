@@ -2,7 +2,7 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
-export default function Landing(){
+export default function Landing() {
   const [room, setRoom] = useState('');
   const [name, setName] = useState('');
   const [creating, setCreating] = useState(false);
@@ -15,7 +15,7 @@ export default function Landing(){
     try {
       const res = await fetch(`${API}/create-room`, {
         method: 'POST',
-        headers: {'Content-Type':'application/json'},
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ room_name: 'private' })
       });
       const data = await res.json();
@@ -27,8 +27,8 @@ export default function Landing(){
         await navigator.clipboard.writeText(url);
         alert('Room created — link copied to clipboard! Paste to share.');
       } catch (error) {
-        console.error('create room error', error);
-        alert('Could not create room; try again.');
+        console.error('clipboard copy error', error);
+        alert('Could not copy link; please copy manually.');
       } finally {
         setCreating(false);
       }
@@ -47,7 +47,7 @@ export default function Landing(){
   };
 
   const joinRoom = () => {
-    if(!room) return alert('Room id required');
+    if (!room) return alert('Room id required');
     const userId = crypto.randomUUID();
     localStorage.setItem('userId', userId);
     localStorage.setItem('username', name || 'Anon');
@@ -55,20 +55,61 @@ export default function Landing(){
   };
 
   return (
-    <div style={{fontFamily:'Inter, system-ui', padding:24, maxWidth:720, margin:'60px auto'}}>
+    <div
+      style={{
+        fontFamily: 'Inter, system-ui',
+        padding: 24,
+        maxWidth: 720,
+        margin: '60px auto'
+      }}
+    >
       <h2>Private Room</h2>
-      <p style={{opacity:.7}}>Create a private room and copy a shareable link. Or paste a Room ID to join.</p>
+      <p style={{ opacity: 0.7 }}>
+        Create a private room and copy a shareable link. Or paste a Room ID to join.
+      </p>
 
-      <div style={{marginTop:20}}>
-        <input placeholder="Your name (optional)" value={name} onChange={e=>setName(e.target.value)} style={{padding:8,width:'100%',marginBottom:10}} />
-        <button onClick={createRoom} disabled={creating} style={{padding:10}}>Create Private Room & Copy Link</button>
+      <div style={{ marginTop: 20 }}>
+        {/* Updated input — press Enter to create room */}
+        <input
+          placeholder="Your name (optional)"
+          value={name}
+          onChange={e => setName(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              createRoom();
+            }
+          }}
+          style={{ padding: 8, width: '100%', marginBottom: 10 }}
+        />
+        <button
+          onClick={createRoom}
+          disabled={creating}
+          style={{ padding: 10 }}
+        >
+          {creating ? 'Creating...' : 'Create Private Room & Copy Link'}
+        </button>
       </div>
 
-      <hr style={{margin:'20px 0'}} />
+      <hr style={{ margin: '20px 0' }} />
 
       <div>
-        <input placeholder="Paste Room ID to join" value={room} onChange={e=>setRoom(e.target.value)} style={{padding:8,width:'100%',marginBottom:10}} />
-        <button onClick={joinRoom} style={{padding:10}}>Join Room</button>
+        {/* Updated input — press Enter to join room */}
+        <input
+          placeholder="Paste Room ID to join"
+          value={room}
+          onChange={e => setRoom(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              joinRoom();
+            }
+          }}
+          style={{ padding: 8, width: '100%', marginBottom: 10 }}
+        />
+        <button onClick={joinRoom} style={{ padding: 10 }}>
+          Join Room
+        </button>
       </div>
     </div>
   );
