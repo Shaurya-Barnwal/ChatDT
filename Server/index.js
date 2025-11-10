@@ -6,24 +6,27 @@ const http = require('http');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const { Pool } = require('pg');
-const crypto = require('crypto');
 
 const app = express();
 
 // allow origins from env (comma-separated), default to * in dev
-const allowed = process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : ['*'];
+const allowed = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(',')
+  : ['*'];
 
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowed.includes('*')) return callback(null, true);
-    if (!allowed.includes(origin)) {
-      const msg = 'CORS: access denied for origin ' + origin;
-      return callback(new Error(msg), false);
-    }
-    return callback(null, true);
-  },
-}));
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (!origin) return callback(null, true);
+      if (allowed.includes('*')) return callback(null, true);
+      if (!allowed.includes(origin)) {
+        const msg = 'CORS: access denied for origin ' + origin;
+        return callback(new Error(msg), false);
+      }
+      return callback(null, true);
+    },
+  })
+);
 
 app.use(express.json());
 
@@ -38,15 +41,16 @@ const io = new Server(server, {
 
 // Postgres pool
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgres://postgres:pass@localhost:5432/chat',
+  connectionString:
+    process.env.DATABASE_URL || 'postgres://postgres:pass@localhost:5432/chat',
 });
 
-// health
+// Simple health endpoint
 app.get('/', (req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
 });
 
-// create room: returns id
+// Create room endpoint
 app.post('/create-room', async (req, res) => {
   const { room_name } = req.body;
   try {
@@ -67,7 +71,7 @@ app.get('/rooms/:roomId/messages', async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT m.message_id, m.sender_id, m.ciphertext, m.iv, m.status,
-              m.delivered_at, m.read_at, m.created_at, u.username
+              m.delivered_at, m.read_at, m.created_at, u.name as username
        FROM messages m
        LEFT JOIN users u ON m.sender_id = u.id
        WHERE m.room_id=$1
@@ -76,17 +80,16 @@ app.get('/rooms/:roomId/messages', async (req, res) => {
       [roomId]
     );
 
-    const rows = result.rows.map(r => ({
+    const rows = result.rows.map((r) => ({
       messageId: r.message_id,
       senderId: r.sender_id,
       username: r.username || 'Anon',
-      // ciphertext/iv may already be base64 strings (text) or buffers (bytea)
-      ciphertext: r.ciphertext && typeof r.ciphertext.toString === 'function' ? r.ciphertext.toString('base64') : r.ciphertext,
-      iv: r.iv && typeof r.iv.toString === 'function' ? r.iv.toString('base64') : r.iv,
+      ciphertext: r.ciphertext ? r.ciphertext.toString('base64') : null,
+      iv: r.iv ? r.iv.toString('base64') : null,
       status: r.status,
       deliveredAt: r.delivered_at,
       readAt: r.read_at,
-      createdAt: r.created_at
+      createdAt: r.created_at,
     }));
 
     res.json(rows);
@@ -96,38 +99,79 @@ app.get('/rooms/:roomId/messages', async (req, res) => {
   }
 });
 
-// Socket handlers
-io.on('connection', socket => {
+/**
+ * Helper: ensure user exists in DB.
+ * Logic:
+ *  - prefer to use provided userId (upsert by id)
+ *  - if userId isn't present or insert conflicts on username -> fallback:
+ *      * try find user by username
+ *      * if found: return that id (and inform client that they should adopt it)
+ *      * otherwise insert new user row and return id
+ */
+async function ensureUser(userId, username) {
+  // prefer: if userId present, try upsert by id
+  if (userId) {
+    try {
+      const upsert = await pool.query(
+        `INSERT INTO users (id, name, username)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, username = COALESCE(EXCLUDED.username, users.username)
+         RETURNING id;`,
+        [userId, username || null, username || null]
+      );
+      return upsert.rows[0].id;
+    } catch (err) {
+      // could be unique username constraint conflict (username exists with different id)
+      console.warn('ensureUser: upsert by id failed', err.code, err.detail);
+      // fallthrough to username-detection below
+    }
+  }
+
+  // if we reach here: either no userId given or upsert by id failed (username conflict)
+  if (username) {
+    // try find existing user by username
+    const found = await pool.query('SELECT id FROM users WHERE username = $1 LIMIT 1', [username]);
+    if (found.rowCount > 0) {
+      return found.rows[0].id;
+    }
+    // not found -> create new row (let DB generate id if serial/uuid default)
+    const inserted = await pool.query(
+      `INSERT INTO users (name, username) VALUES ($1, $2) RETURNING id`,
+      [username || null, username || null]
+    );
+    return inserted.rows[0].id;
+  }
+
+  // fallback: insert anonymous user with generated id by DB (rare)
+  const inserted = await pool.query(
+    `INSERT INTO users (name, username) VALUES ($1, $2) RETURNING id`,
+    [null, null]
+  );
+  return inserted.rows[0].id;
+}
+
+io.on('connection', (socket) => {
   console.log('socket connected', socket.id);
 
-  // join-room
+  // JOIN ROOM — accepts roomId, userId, username
   socket.on('join-room', async ({ roomId, userId, username }) => {
     try {
-      // ensure we have a userId; if not, generate a server-side one and tell client
-      let realUserId = userId;
-      if (!realUserId) {
-        realUserId = crypto.randomUUID();
-        socket.emit('user-id', { userId: realUserId });
+      // ensure user exists and get canonical user id
+      const canonicalUserId = await ensureUser(userId, username);
+      // if the canonicalId differs from what client sent, tell client to adopt it
+      if (!userId || canonicalUserId !== userId) {
+        socket.emit('assign-user-id', { userId: canonicalUserId });
       }
 
-      const uname = username || 'Anon';
-
-      // upsert user (using column "username")
-      await pool.query(
-        `INSERT INTO users (id, username) VALUES ($1, $2)
-         ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username`,
-        [realUserId, uname]
-      );
-
       socket.join(roomId);
-      console.log(`${realUserId} joined ${roomId} as ${uname}`);
+      console.log(`${canonicalUserId} joined ${roomId} as ${username || 'Anon'}`);
 
-      // broadcast presence (others)
-      socket.to(roomId).emit('user-joined', { userId: realUserId, username: uname });
+      // broadcast presence to room
+      socket.to(roomId).emit('user-joined', { userId: canonicalUserId, username: username || 'Anon' });
 
-      // fetch recent messages with usernames
-      const result = await pool.query(
-        `SELECT m.*, u.username
+      // load recent messages with usernames
+      const res = await pool.query(
+        `SELECT m.*, u.name as username, u.username as username_key
          FROM messages m
          LEFT JOIN users u ON m.sender_id = u.id
          WHERE m.room_id = $1
@@ -136,11 +180,15 @@ io.on('connection', socket => {
         [roomId]
       );
 
-      const normalized = result.rows.map(r => ({
+      // normalize rows and convert bytea -> base64
+      const normalized = res.rows.map((r) => ({
         messageId: r.message_id || r.messageId,
         senderId: r.sender_id || r.senderId,
-        username: r.username || r.username || 'Anon',
-        ciphertext: r.ciphertext && typeof r.ciphertext.toString === 'function' ? r.ciphertext.toString('base64') : r.ciphertext,
+        username: r.username || r.username_key || 'Anon',
+        ciphertext:
+          r.ciphertext && typeof r.ciphertext.toString === 'function'
+            ? r.ciphertext.toString('base64')
+            : r.ciphertext,
         iv: r.iv && typeof r.iv.toString === 'function' ? r.iv.toString('base64') : r.iv,
         status: r.status,
         createdAt: r.created_at || r.createdAt,
@@ -153,68 +201,65 @@ io.on('connection', socket => {
     }
   });
 
-  // send-message
-  socket.on('send-message', async ({ roomId, userId, username, ciphertext, iv, messageId, createdAt }) => {
+  // SEND MESSAGE — client should include messageId, roomId, userId, username, ciphertext (base64), iv (base64), createdAt
+  socket.on('send-message', async (payload) => {
+    const { roomId, userId, username, ciphertext, iv, messageId, createdAt } = payload || {};
     try {
-      // ensure userId
-      let realUserId = userId;
-      if (!realUserId) {
-        realUserId = crypto.randomUUID();
-        socket.emit('user-id', { userId: realUserId });
-      }
-      const uname = username || 'Anon';
+      const canonicalUserId = await ensureUser(userId, username);
 
-      // upsert user (username column)
-      await pool.query(
-        `INSERT INTO users (id, username) VALUES ($1,$2)
-         ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username;`,
-        [realUserId, uname]
-      );
-
-      // Note: this stores ciphertext/iv as TEXT (base64). If your DB uses bytea,
-      // change the VALUES line to: decode($4, 'base64') and decode($5, 'base64')
-      // and keep ciphertext/iv as base64 strings in the params.
-      const insert = await pool.query(
+      // Insert message. IMPORTANT:
+      // - if your DB message.ciphertext/iv columns are bytea, you may want to store decode($4,'base64') etc.
+      // For compatibility, we store as TEXT here (assuming schema supports it). If your schema has bytea,
+      // change the query to use decode($4, 'base64') and decode($5, 'base64').
+      const insertQ = await pool.query(
         `INSERT INTO messages (message_id, room_id, sender_id, ciphertext, iv, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6) RETURNING *;`,
-        [messageId, roomId, realUserId, ciphertext, iv, createdAt || new Date().toISOString()]
+         VALUES ($1,$2,$3,$4,$5,$6)
+         RETURNING *;`,
+        [messageId, roomId, canonicalUserId, ciphertext, iv, createdAt || new Date().toISOString()]
       );
 
-      const row = insert.rows[0];
+      const row = insertQ.rows[0];
 
-      const ciphertextBase64 = row.ciphertext && typeof row.ciphertext.toString === 'function' ? row.ciphertext.toString('base64') : row.ciphertext;
-      const ivBase64 = row.iv && typeof row.iv.toString === 'function' ? row.iv.toString('base64') : row.iv;
+      // normalize fields and ensure ciphertext/iv are base64 strings (if DB returns bytea)
+      const ciphertextBase64 =
+        row.ciphertext && row.ciphertext.toString ? row.ciphertext.toString('base64') : row.ciphertext;
+      const ivBase64 = row.iv && row.iv.toString ? row.iv.toString('base64') : row.iv;
 
-      const payload = {
+      // build payload
+      const out = {
         messageId: row.message_id || row.messageId,
         roomId: row.room_id || row.roomId,
         senderId: row.sender_id || row.senderId,
-        username: uname,
+        username: username || row.name || 'Anon',
         ciphertext: ciphertextBase64,
         iv: ivBase64,
         status: row.status || 'sent',
-        createdAt: row.created_at || row.createdAt || new Date().toISOString()
+        createdAt: row.created_at || row.createdAt || new Date().toISOString(),
       };
 
-      // broadcast to room
-      io.to(roomId).emit('message', payload);
+      // broadcast to everyone in the room ONLY
+      io.to(roomId).emit('message', out);
 
-      // ack to sender that DB saved it
-      socket.emit('message-saved', { messageId: payload.messageId, status: payload.status });
+      // ack saved to sender only
+      socket.emit('message-saved', { messageId: out.messageId, status: out.status });
     } catch (err) {
       console.error('send-message error', err);
-      socket.emit('send-error', { error: 'db error' });
+      socket.emit('send-error', { error: 'db error', raw: err.message });
     }
   });
 
-  // receipts
+  // Delivery receipt: update message row and emit to the room the status change
   socket.on('message-received', async ({ messageId, userId }) => {
     try {
+      // fetch message to get room
+      const m = await pool.query('SELECT room_id FROM messages WHERE message_id=$1 LIMIT 1', [messageId]);
+      const roomId = m.rows[0]?.room_id;
       await pool.query(
         'UPDATE messages SET status=$1, delivered_at=COALESCE(delivered_at, now()) WHERE message_id=$2',
         ['delivered', messageId]
       );
-      io.emit('message-status-update', { messageId, status: 'delivered', ts: new Date().toISOString() });
+      // emit status update to the room only
+      if (roomId) io.to(roomId).emit('message-status-update', { messageId, status: 'delivered', ts: new Date().toISOString() });
     } catch (err) {
       console.error('message-received error', err);
     }
@@ -222,11 +267,13 @@ io.on('connection', socket => {
 
   socket.on('message-read', async ({ messageId, userId }) => {
     try {
+      const m = await pool.query('SELECT room_id FROM messages WHERE message_id=$1 LIMIT 1', [messageId]);
+      const roomId = m.rows[0]?.room_id;
       await pool.query(
         'UPDATE messages SET status=$1, read_at=COALESCE(read_at, now()) WHERE message_id=$2',
         ['read', messageId]
       );
-      io.emit('message-status-update', { messageId, status: 'read', ts: new Date().toISOString() });
+      if (roomId) io.to(roomId).emit('message-status-update', { messageId, status: 'read', ts: new Date().toISOString() });
     } catch (err) {
       console.error('message-read error', err);
     }

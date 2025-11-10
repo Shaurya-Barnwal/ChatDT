@@ -94,6 +94,13 @@ export default function Chat() {
       }
     });
 
+    socket.on("assign-user-id", ({ userId }) => {
+      localStorage.setItem(
+        "userId",
+        userId
+      ); /* optional: reload or update local var */
+    });
+
     socket.on("message", async (payload) => {
       setMessages((prev) => [...prev, payload]);
 
