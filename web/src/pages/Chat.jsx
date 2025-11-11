@@ -19,7 +19,9 @@ export default function Chat() {
   const [showNamePrompt, setShowNamePrompt] = useState(false);
   const [tempName, setTempName] = useState("");
 
-  const userId = localStorage.getItem("userId") || window.crypto.randomUUID();
+  // identity
+  const storedUserId = localStorage.getItem("userId");
+  const userId = storedUserId || window.crypto.randomUUID();
 
   const messagesRef = useRef([]);
   const listRef = useRef(null);
@@ -62,7 +64,19 @@ export default function Chat() {
     fetch(`${API}/rooms/${roomId}/messages`)
       .then((r) => r.json())
       .then((data) => {
-        setMessages(data.map((m) => ({ ...m })));
+        // ensure normalization on incoming list
+        const normalized = (Array.isArray(data) ? data : []).map((m) => ({
+          messageId: m.messageId || m.message_id,
+          roomId: m.roomId || m.room_id,
+          senderId: m.senderId || m.sender_id,
+          username: m.username || m.name || "Anon",
+          ciphertext: m.ciphertext,
+          iv: m.iv,
+          status: m.status || "sent",
+          createdAt: m.createdAt || m.created_at,
+          plaintext: m.plaintext || undefined,
+        }));
+        setMessages(normalized);
       })
       .catch(console.error);
   }, [roomId]);
@@ -76,71 +90,109 @@ export default function Chat() {
     socket.on("connect", () => {
       const username = localStorage.getItem("username") || "Anon";
       socket.emit("join-room", { roomId, userId, username });
-      console.log(
-        "joined room",
-        roomId,
-        "userId",
-        userId,
-        "username",
-        username
-      );
+      console.log("joined room", roomId, "userId", userId, "username", username);
     });
 
-    // save server-generated userId (if server issues one)
-    socket.on("user-id", ({ userId: serverUserId }) => {
+    // server may respond with saved id or similar events in other implementations
+    socket.on("assign-user-id", ({ userId: serverUserId }) => {
       if (serverUserId) {
         localStorage.setItem("userId", serverUserId);
-        console.log("saved server-generated userId", serverUserId);
+        // not reloading — we keep local userId variable; next connection will pick up saved id
       }
     });
 
-    socket.on("assign-user-id", ({ userId }) => {
-      localStorage.setItem(
-        "userId",
-        userId
-      ); /* optional: reload or update local var */
-    });
-
+    // handle incoming messages from *other* users
     socket.on("message", async (payload) => {
-      setMessages((prev) => [...prev, payload]);
-
-      // ACK delivered to server (now includes roomId)
-      socket.emit("message-received", {
+      // normalized payload shape
+      const normalized = {
         messageId: payload.messageId,
+        roomId: payload.roomId,
+        senderId: payload.senderId,
+        username: payload.username || "Anon",
+        ciphertext: payload.ciphertext,
+        iv: payload.iv,
+        status: payload.status || "sent",
+        createdAt: payload.createdAt,
+      };
+
+      // If we already have this message (optimistic), merge; otherwise append
+      const exists = messagesRef.current.find((m) => m.messageId === normalized.messageId);
+      if (exists) {
+        setMessages((prev) => prev.map((m) => (m.messageId === normalized.messageId ? { ...m, ...normalized } : m)));
+      } else {
+        setMessages((prev) => [...prev, normalized]);
+      }
+
+      // ACK delivered
+      socket.emit("message-received", {
+        messageId: normalized.messageId,
         userId,
         roomId,
       });
 
-      try {
-        const pt = await decryptText(key, payload.iv, payload.ciphertext);
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.messageId === payload.messageId ? { ...m, plaintext: pt } : m
-          )
-        );
+      // Try to decrypt if we have the key
+      if (key && normalized.ciphertext && normalized.iv) {
+        try {
+          const pt = await decryptText(key, normalized.iv, normalized.ciphertext);
+          setMessages((prev) => prev.map((m) => (m.messageId === normalized.messageId ? { ...m, plaintext: pt } : m)));
 
-        // ACK read to server (now includes roomId)
-        socket.emit("message-read", {
-          messageId: payload.messageId,
-          userId,
-          roomId,
-        });
-      } catch (err) {
-        console.warn("decrypt failed", err);
+          // ACK read
+          socket.emit("message-read", {
+            messageId: normalized.messageId,
+            userId,
+            roomId,
+          });
+        } catch (err) {
+          console.warn("decrypt failed for incoming message", err);
+        }
       }
     });
 
-    socket.on("message-saved", ({ messageId, status }) => {
-      setStatusMap((m) => ({ ...m, [messageId]: status }));
+    // message-saved: this is the canonical server ack for messages YOU SENT.
+    // server now sends full message payload so we can merge/replace optimistic entry.
+    socket.on("message-saved", async (payload) => {
+      const normalized = {
+        messageId: payload.messageId,
+        roomId: payload.roomId,
+        senderId: payload.senderId,
+        username: payload.username || localStorage.getItem("username") || "Anon",
+        ciphertext: payload.ciphertext,
+        iv: payload.iv,
+        status: payload.status || "sent",
+        createdAt: payload.createdAt,
+      };
+
+      // Merge with optimistic message (if present) or append
+      const exists = messagesRef.current.find((m) => m.messageId === normalized.messageId);
+      if (exists) {
+        setMessages((prev) => prev.map((m) => (m.messageId === normalized.messageId ? { ...m, ...normalized, plaintext: m.plaintext } : m)));
+      } else {
+        // Ensure we append if for some reason optimistic wasn't created
+        setMessages((prev) => [...prev, normalized]);
+      }
+
+      // update status map
+      setStatusMap((m) => ({ ...m, [normalized.messageId]: normalized.status }));
+
+      // If this client is the sender and we have key, attempt to decrypt (so sender doesn't see "Encrypted message")
+      const isMine = normalized.senderId === userId;
+      if (isMine && key && normalized.ciphertext && normalized.iv) {
+        try {
+          const pt = await decryptText(key, normalized.iv, normalized.ciphertext);
+          setMessages((prev) => prev.map((m) => (m.messageId === normalized.messageId ? { ...m, plaintext: pt } : m)));
+        } catch (err) {
+          console.warn("decrypt failed on message-saved for own message", err);
+        }
+      }
     });
 
     socket.on("message-status-update", ({ messageId, status }) => {
       setStatusMap((m) => ({ ...m, [messageId]: status }));
-      setMessages((prev) =>
-        prev.map((msg) =>
-          msg.messageId === messageId ? { ...msg, status } : msg
-        )
-      );
+      setMessages((prev) => prev.map((msg) => (msg.messageId === messageId ? { ...msg, status } : msg)));
+    });
+
+    socket.on("send-error", (err) => {
+      console.error("send-error", err);
     });
 
     return () => {
@@ -151,7 +203,8 @@ export default function Chat() {
       }
       socket = null;
     };
-  }, [key, roomId, userId, showNamePrompt]);
+    
+  }, [key, roomId, userId, showNamePrompt]); // note: key in deps so we re-init when unlock
 
   const unlock = async () => {
     if (!passphrase) return alert("Enter passphrase");
@@ -162,11 +215,13 @@ export default function Chat() {
   const send = async () => {
     if (!text.trim()) return;
     if (!key) return alert("Unlock with passphrase first");
+    if (!socket || socket.disconnected) return alert("Socket not connected");
 
     const messageId = window.crypto.randomUUID();
     const createdAt = new Date().toISOString();
     const { iv, ciphertext } = await encryptText(key, text);
 
+    // normalized optimistic message
     const msg = {
       messageId,
       roomId,
@@ -178,19 +233,27 @@ export default function Chat() {
       plaintext: text,
       status: "sending",
     };
+
+    // append optimistic message
     setMessages((p) => [...p, msg]);
     setText("");
 
-    const username = localStorage.getItem("username") || "Anon";
-    socket.emit("send-message", {
-      messageId,
-      roomId,
-      senderId: userId,
-      username,
-      ciphertext,
-      iv,
-      createdAt,
-    });
+    // emit send to server
+    try {
+      socket.emit("send-message", {
+        messageId,
+        roomId,
+        userId,
+        username: localStorage.getItem("username") || "Anon",
+        ciphertext,
+        iv,
+        createdAt,
+      });
+    } catch (err) {
+      console.error("emit send-message failed", err);
+      // mark sending failed
+      setMessages((prev) => prev.map((m) => (m.messageId === messageId ? { ...m, status: "failed" } : m)));
+    }
   };
 
   function renderTick(m) {
@@ -205,7 +268,7 @@ export default function Chat() {
 
   return (
     <div className="chat-page">
-      {/* ✅ USERNAME PROMPT BLOCK */}
+      {/* USERNAME PROMPT BLOCK */}
       {showNamePrompt && (
         <div
           style={{
@@ -298,23 +361,19 @@ export default function Chat() {
         <>
           <div className="messages" ref={listRef}>
             {messages.map((msg, idx) => {
-              const mine = msg.sender_id === userId || msg.senderId === userId;
+              const mine = msg.senderId === userId;
               const username = msg.username || "Anon";
-              const textToShow =
-                msg.plaintext ?? "Encrypted message (unlock to view)";
-              const createdAt = msg.created_at || msg.createdAt;
+              const textToShow = msg.plaintext ?? "Encrypted message (unlock to view)";
+              const createdAt = msg.createdAt;
 
               return (
                 <div
-                  key={msg.message_id || msg.messageId || idx}
+                  key={msg.messageId || idx}
                   className={`msg-row ${mine ? "mine" : "theirs"}`}
                 >
                   <div
-                    className={`bubble ${
-                      mine ? "bubble-mine" : "bubble-theirs"
-                    }`}
+                    className={`bubble ${mine ? "bubble-mine" : "bubble-theirs"}`}
                   >
-                    {/* show username label only for others */}
                     {!mine && (
                       <div
                         style={{
@@ -330,9 +389,7 @@ export default function Chat() {
                     <div className="msg-text">{textToShow}</div>
                     <div className="msg-meta">
                       <div className="time">
-                        {createdAt
-                          ? new Date(createdAt).toLocaleTimeString()
-                          : ""}
+                        {createdAt ? new Date(createdAt).toLocaleTimeString() : ""}
                       </div>
                       <div className="tick-wrap">{renderTick(msg)}</div>
                     </div>
@@ -355,7 +412,11 @@ export default function Chat() {
                 }
               }}
             />
-            <button className="btn btn-send" onClick={send}>
+            <button
+              className="btn btn-send"
+              onClick={send}
+              disabled={!text.trim() || !key}
+            >
               Send
             </button>
           </div>

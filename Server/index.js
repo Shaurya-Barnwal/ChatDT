@@ -70,9 +70,8 @@ app.get("/rooms/:roomId/messages", async (req, res) => {
   const { roomId } = req.params;
   try {
     const q = `
-      SELECT m.message_id, m.sender_id, m.ciphertext, m.iv, m.status,
+      SELECT m.message_id, m.room_id, m.sender_id, m.ciphertext, m.iv, m.status,
              m.delivered_at, m.read_at, m.created_at,
-             -- support both ` + "`username`" + ` and ` + "`name`" + ` columns if present
              COALESCE(u.username, u.name) AS username
       FROM messages m
       LEFT JOIN users u ON m.sender_id = u.id
@@ -84,6 +83,7 @@ app.get("/rooms/:roomId/messages", async (req, res) => {
 
     const rows = result.rows.map((r) => ({
       messageId: r.message_id,
+      roomId: r.room_id,
       senderId: r.sender_id,
       username: r.username || "Anon",
       // ciphertext/iv might already be text or Buffer — convert to base64 string if Buffer
@@ -111,30 +111,62 @@ app.get("/rooms/:roomId/messages", async (req, res) => {
 io.on("connection", (socket) => {
   console.log("socket connected", socket.id);
 
-  // helper upsert user (returns { id, username })
+  // helper: robust upsert/ensure user exists and return canonical { id, username }
   async function upsertUser({ userId, username }) {
     username = (username || "Anon").trim();
 
-    // prefer upsert by id when provided, otherwise upsert by username
-    if (userId) {
-      const q = `
-        INSERT INTO users (id, username)
-        VALUES ($1, $2)
-        ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username
-        RETURNING id, COALESCE(username, name) as username;
-      `;
-      const r = await pool.query(q, [userId, username]);
-      return r.rows[0];
-    } else {
-      // upsert by username (if schema enforces username unique)
-      const q = `
-        INSERT INTO users (username)
-        VALUES ($1)
-        ON CONFLICT (username) DO UPDATE SET username = EXCLUDED.username
-        RETURNING id, COALESCE(username, name) as username;
-      `;
-      const r = await pool.query(q, [username]);
-      return r.rows[0];
+    // Defensive approach:
+    // - If userId provided: try to find by id. If exists -> optionally update username. If not -> try to insert with that id.
+    // - If only username provided: try to find existing row, otherwise insert.
+    try {
+      if (userId) {
+        // Try find by id first
+        const sel = await pool.query("SELECT id, COALESCE(username, name) AS username FROM users WHERE id = $1", [userId]);
+        if (sel.rowCount > 0) {
+          // optionally update username if different
+          const existing = sel.rows[0];
+          if ((existing.username || "") !== username) {
+            try {
+              await pool.query("UPDATE users SET username = $1 WHERE id = $2", [username, userId]);
+            } catch (updErr) {
+              console.warn("could not update username for existing id:", updErr.message);
+            }
+          }
+          return { id: existing.id, username: username || existing.username };
+        } else {
+          // Insert with provided id. If schema uses UUID and forbids client-provided id this will fail; handle conflict below.
+          try {
+            const ins = await pool.query(
+              "INSERT INTO users (id, username) VALUES ($1, $2) RETURNING id, COALESCE(username, name) AS username",
+              [userId, username]
+            );
+            if (ins.rowCount > 0) return ins.rows[0];
+          } catch (insErr) {
+            // possibly unique/constraint error — fallback to select by username
+            console.warn("insert user by id failed, falling back to username lookup:", insErr.message);
+          }
+        }
+      }
+
+      // No userId or insert-by-id failed — use username path
+      // Try find by username first
+      const selByName = await pool.query("SELECT id, COALESCE(username, name) AS username FROM users WHERE username = $1 OR name = $1 LIMIT 1", [username]);
+      if (selByName.rowCount > 0) {
+        return selByName.rows[0];
+      }
+
+      // Insert a new user (no id provided)
+      const ins = await pool.query(
+        "INSERT INTO users (username) VALUES ($1) RETURNING id, COALESCE(username, name) AS username",
+        [username]
+      );
+      if (ins.rowCount > 0) return ins.rows[0];
+
+      // As a last resort return an anonymous synthetic id (shouldn't happen)
+      return { id: userId || null, username };
+    } catch (err) {
+      console.error("upsertUser error", err);
+      throw err;
     }
   }
 
@@ -155,7 +187,8 @@ io.on("connection", (socket) => {
 
       // load recent messages and send to the joining socket
       const q = `
-        SELECT m.*, COALESCE(u.username, u.name) AS username
+        SELECT m.message_id, m.room_id, m.sender_id, m.ciphertext, m.iv, m.status, m.created_at,
+               COALESCE(u.username, u.name) AS username
         FROM messages m
         LEFT JOIN users u ON m.sender_id = u.id
         WHERE m.room_id = $1
@@ -165,9 +198,10 @@ io.on("connection", (socket) => {
       const resRows = await pool.query(q, [roomId]);
 
       const normalized = resRows.rows.map((r) => ({
-        messageId: r.message_id || r.messageId,
-        senderId: r.sender_id || r.senderId,
-        username: r.username || r.name || "Anon",
+        messageId: r.message_id,
+        roomId: r.room_id,
+        senderId: r.sender_id,
+        username: r.username || "Anon",
         ciphertext:
           r.ciphertext && typeof r.ciphertext.toString === "function"
             ? r.ciphertext.toString("base64")
@@ -176,8 +210,8 @@ io.on("connection", (socket) => {
           r.iv && typeof r.iv.toString === "function"
             ? r.iv.toString("base64")
             : r.iv,
-        status: r.status,
-        createdAt: r.created_at || r.createdAt,
+        status: r.status || "sent",
+        createdAt: r.created_at,
       }));
 
       socket.emit("recent-messages", normalized);
@@ -197,12 +231,14 @@ io.on("connection", (socket) => {
         const effectiveUserId = user.id;
         const effectiveUsername = user.username || username || "Anon";
 
-        // Insert message. We store ciphertext/iv as text here (base64). If your schema uses bytea,
-        // change the INSERT to use decode($4, 'base64') for ciphertext and decode($5, 'base64') for iv.
+        // Insert message. We store ciphertext/iv as text here (base64).
+        // NOTE: If your messages.ciphertext and messages.iv columns are type `bytea`, use:
+        //   ... VALUES ($1,$2,$3, decode($4,'base64'), decode($5,'base64'), $6)
+        // instead of passing base64 strings directly.
         const insertQ = `
           INSERT INTO messages (message_id, room_id, sender_id, ciphertext, iv, created_at)
           VALUES ($1,$2,$3,$4,$5,$6)
-          RETURNING *;
+          RETURNING message_id, room_id, sender_id, ciphertext, iv, status, created_at;
         `;
         const insertValues = [
           messageId,
@@ -226,21 +262,21 @@ io.on("connection", (socket) => {
             : row.iv;
 
         const payload = {
-          messageId: row.message_id || row.messageId,
-          roomId: row.room_id || row.roomId,
-          senderId: row.sender_id || row.senderId,
+          messageId: row.message_id,
+          roomId: row.room_id,
+          senderId: row.sender_id,
           username: effectiveUsername,
           ciphertext: ciphertextBase64,
           iv: ivBase64,
           status: row.status || "sent",
-          createdAt: row.created_at || row.createdAt || new Date().toISOString(),
+          createdAt: row.created_at || new Date().toISOString(),
         };
 
         // Broadcast to everyone in the room EXCEPT the sender — avoids duplicate on sender side
         socket.to(roomId).emit("message", payload);
 
-        // Tell the sender the DB saved the message (so client can update local status)
-        socket.emit("message-saved", { messageId: payload.messageId, status: payload.status });
+        // Tell the sender the DB saved the message (full payload so client can merge/replace optimistic)
+        socket.emit("message-saved", payload);
 
       } catch (err) {
         console.error("send-message error", err);
