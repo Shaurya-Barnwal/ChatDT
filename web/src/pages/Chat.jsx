@@ -2,15 +2,32 @@
 import React, { useEffect, useState, useRef } from "react";
 import { useParams } from "react-router-dom";
 import io from "socket.io-client";
-import { deriveKey, encryptText, decryptText } from "../utils/crypto";
+import { deriveKey, encryptText, decryptText, exportKeyBase64 } from "../utils/crypto";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:4000";
 let socket;
+
+// safeDecrypt helper (placed near top, below imports)
+async function safeDecrypt(k, iv, ct) {
+  try {
+    if (!iv || !ct) throw new Error("missing iv or ciphertext");
+    // helpful debug if non-strings arrive
+    if (typeof iv !== "string" || typeof ct !== "string") {
+      console.warn("safeDecrypt: expected strings for iv/ciphertext; got types:", typeof iv, typeof ct, { iv, ct });
+    }
+    const pt = await decryptText(k, iv, ct);
+    return pt;
+  } catch (e) {
+    console.warn("safeDecrypt failed:", e && e.message ? e.message : e);
+    return null;
+  }
+}
 
 export default function Chat() {
   const { roomId } = useParams();
   const [passphrase, setPassphrase] = useState("");
   const [key, setKey] = useState(null);
+  const [keyFingerprint, setKeyFingerprint] = useState(null);
   const [messages, setMessages] = useState([]);
   const [text, setText] = useState("");
   const [statusMap, setStatusMap] = useState({});
@@ -93,17 +110,14 @@ export default function Chat() {
       console.log("joined room", roomId, "userId", userId, "username", username);
     });
 
-    // server may respond with saved id or similar events in other implementations
     socket.on("assign-user-id", ({ userId: serverUserId }) => {
       if (serverUserId) {
         localStorage.setItem("userId", serverUserId);
-        // not reloading — we keep local userId variable; next connection will pick up saved id
       }
     });
 
     // handle incoming messages from *other* users
     socket.on("message", async (payload) => {
-      // normalized payload shape
       const normalized = {
         messageId: payload.messageId,
         roomId: payload.roomId,
@@ -115,7 +129,6 @@ export default function Chat() {
         createdAt: payload.createdAt,
       };
 
-      // If we already have this message (optimistic), merge; otherwise append
       const exists = messagesRef.current.find((m) => m.messageId === normalized.messageId);
       if (exists) {
         setMessages((prev) => prev.map((m) => (m.messageId === normalized.messageId ? { ...m, ...normalized } : m)));
@@ -148,8 +161,7 @@ export default function Chat() {
       }
     });
 
-    // message-saved: this is the canonical server ack for messages YOU SENT.
-    // server now sends full message payload so we can merge/replace optimistic entry.
+    // message-saved: canonical ack for messages YOU SENT.
     socket.on("message-saved", async (payload) => {
       const normalized = {
         messageId: payload.messageId,
@@ -162,19 +174,16 @@ export default function Chat() {
         createdAt: payload.createdAt,
       };
 
-      // Merge with optimistic message (if present) or append
       const exists = messagesRef.current.find((m) => m.messageId === normalized.messageId);
       if (exists) {
         setMessages((prev) => prev.map((m) => (m.messageId === normalized.messageId ? { ...m, ...normalized, plaintext: m.plaintext } : m)));
       } else {
-        // Ensure we append if for some reason optimistic wasn't created
         setMessages((prev) => [...prev, normalized]);
       }
 
-      // update status map
       setStatusMap((m) => ({ ...m, [normalized.messageId]: normalized.status }));
 
-      // If this client is the sender and we have key, attempt to decrypt (so sender doesn't see "Encrypted message")
+      // If this client is the sender and we have key, attempt to decrypt
       const isMine = normalized.senderId === userId;
       if (isMine && key && normalized.ciphertext && normalized.iv) {
         try {
@@ -203,13 +212,63 @@ export default function Chat() {
       }
       socket = null;
     };
-    
-  }, [key, roomId, userId, showNamePrompt]); // note: key in deps so we re-init when unlock
 
+  }, [key, roomId, userId, showNamePrompt]);
+
+  // unlock now trims passphrase and roomId and exports a short fingerprint for debugging
   const unlock = async () => {
     if (!passphrase) return alert("Enter passphrase");
-    const k = await deriveKey(passphrase, roomId);
-    setKey(k);
+    const passTrim = (passphrase || "").trim();
+    const roomTrim = (roomId || "").trim();
+
+    try {
+      const k = await deriveKey(passTrim, roomTrim);
+      setKey(k);
+
+      // expose key for quick console tests and export fingerprint if available
+      try {
+        window._chatKey = k;
+        if (typeof exportKeyBase64 === "function") {
+          const exported = await exportKeyBase64(k);
+          const short = exported ? exported.slice(0, 12) : null;
+          setKeyFingerprint(short);
+          console.log("Derived key fingerprint (first 12 chars):", short);
+        }
+      } catch (e) {
+        console.warn("exportKeyBase64 failed:", e && e.message ? e.message : e);
+      }
+
+      // attempt to decrypt any messages already loaded
+      if (messagesRef.current && messagesRef.current.length > 0) {
+        const toUpdate = [];
+        for (const m of messagesRef.current) {
+          if (!m.plaintext && m.ciphertext && m.iv) {
+            const pt = await safeDecrypt(k, m.iv, m.ciphertext);
+            if (pt !== null) toUpdate.push({ messageId: m.messageId, plaintext: pt });
+          }
+        }
+        if (toUpdate.length > 0) {
+          setMessages((prev) =>
+            prev.map((m) => {
+              const found = toUpdate.find((u) => u.messageId === m.messageId);
+              return found ? { ...m, plaintext: found.plaintext } : m;
+            })
+          );
+        }
+      }
+    } catch (err) {
+      // improved debug logging instead of bare "err"
+      console.error("deriveKey failed:", err && err.message ? err.message : err);
+      console.groupCollapsed("deriveKey debug");
+      console.log("passphrase length:", (passphrase || "").length);
+      console.log("roomId (raw):", roomId);
+      console.log("roomId (stringified):", JSON.stringify(roomId));
+      console.log("Tip: ensure both clients use the exact same passphrase and roomId (no leading/trailing spaces).");
+      console.groupEnd();
+
+      alert("Failed to derive key. Check passphrase and room id; see console for details.");
+      setKey(null);
+    }
   };
 
   const send = async () => {
@@ -221,7 +280,6 @@ export default function Chat() {
     const createdAt = new Date().toISOString();
     const { iv, ciphertext } = await encryptText(key, text);
 
-    // normalized optimistic message
     const msg = {
       messageId,
       roomId,
@@ -234,11 +292,9 @@ export default function Chat() {
       status: "sending",
     };
 
-    // append optimistic message
     setMessages((p) => [...p, msg]);
     setText("");
 
-    // emit send to server
     try {
       socket.emit("send-message", {
         messageId,
@@ -251,7 +307,6 @@ export default function Chat() {
       });
     } catch (err) {
       console.error("emit send-message failed", err);
-      // mark sending failed
       setMessages((prev) => prev.map((m) => (m.messageId === messageId ? { ...m, status: "failed" } : m)));
     }
   };
@@ -334,6 +389,11 @@ export default function Chat() {
       <header className="chat-header">
         <h3>Private Room</h3>
         <p className="room-id">Room: {roomId}</p>
+        {keyFingerprint && (
+          <div style={{ fontSize: 12, opacity: 0.8, marginTop: 6 }}>
+            Key fingerprint: <strong>{keyFingerprint}</strong> (first 12 chars)
+          </div>
+        )}
       </header>
 
       {!key ? (
