@@ -13,6 +13,16 @@ export default function Landing() {
   const createRoom = async () => {
     setCreating(true);
 
+    // normalize & persist display name for reconnects / send-message fallback
+    const trimmedName = (name || "").trim() || "Anon";
+    try {
+      localStorage.setItem("displayName", trimmedName);
+      // keep legacy key for compatibility with older code
+      localStorage.setItem("username", trimmedName);
+    } catch (e) {
+      console.warn("Could not write displayName to localStorage", e);
+    }
+
     try {
       const res = await fetch(`${API}/create-room`, {
         method: "POST",
@@ -48,7 +58,6 @@ export default function Landing() {
       } catch (clipboardError) {
         console.warn("clipboard copy failed", clipboardError);
         // fallback: show the link in prompt (user can copy)
-        // prompt sometimes blocked by some browsers but at least we attempted
         try {
           window.prompt("Room created — copy this link:", url);
         } catch (promptError) {
@@ -59,7 +68,13 @@ export default function Landing() {
       // set local identity and navigate
       const userId = crypto.randomUUID();
       localStorage.setItem("userId", userId);
-      localStorage.setItem("username", name || "Anon");
+      // make sure username/displayName already set above; if not, set here
+      if (!localStorage.getItem("username")) {
+        localStorage.setItem("username", trimmedName);
+      }
+      if (!localStorage.getItem("displayName")) {
+        localStorage.setItem("displayName", trimmedName);
+      }
       navigate(`/chat/${roomId}`);
     } catch (error) {
       console.error("create room error", error);
@@ -72,7 +87,8 @@ export default function Landing() {
         const roomId = crypto.randomUUID();
         const userId = crypto.randomUUID();
         localStorage.setItem("userId", userId);
-        localStorage.setItem("username", name || "Anon");
+        localStorage.setItem("username", trimmedName);
+        localStorage.setItem("displayName", trimmedName);
         alert(
           `Local room created (temporary): ${roomId}\nShare this ID manually if needed.`
         );
@@ -85,9 +101,21 @@ export default function Landing() {
 
   const joinRoom = () => {
     if (!room) return alert("Room id required");
+
+    // normalize & persist display name for reconnects / send-message fallback
+    const trimmedName = (name || "").trim() || "Anon";
+    try {
+      localStorage.setItem("displayName", trimmedName);
+      // keep legacy key for compatibility with older code
+      localStorage.setItem("username", trimmedName);
+    } catch (e) {
+      console.warn("Could not write displayName to localStorage", e);
+    }
+
     const userId = crypto.randomUUID();
     localStorage.setItem("userId", userId);
-    localStorage.setItem("username", name || "Anon");
+
+    // navigate to chat (actual join/emit usually happens inside Chat page)
     navigate(`/chat/${room}`);
   };
 

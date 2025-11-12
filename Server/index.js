@@ -248,59 +248,34 @@ io.on("connection", (socket) => {
   });
 
   // send-message: store and broadcast to others in the room (not the sender)
-  socket.on(
-    "send-message",
-    async ({
-      roomId,
-      userId,
-      username,
-      ciphertext,
-      iv,
-      messageId,
-      createdAt,
-    }) => {
-      try {
-        // ensure user exists, get canonical id
-        const user = await upsertUser({ userId, username });
-        const effectiveUserId = user.id;
-        const effectiveUsername = user.username || username || "Anon";
+  // Server/index.js (inside io/socket setup)
+  socket.on("send-message", async (payload) => {
+    try {
+      console.log("server recv send-message:", payload);
 
-        // Insert message. We store ciphertext/iv as text here (base64).
-        // NOTE: If your messages.ciphertext and messages.iv columns are type `bytea`, use:
-        //   ... VALUES ($1,$2,$3, decode($4,'base64'), decode($5,'base64'), $6)
-        // instead of passing base64 strings directly.
-        const insertQ = `
-          INSERT INTO messages (message_id, room_id, sender_id, ciphertext, iv, created_at)
-          VALUES ($1,$2,$3,$4,$5,$6)
-          RETURNING message_id, room_id, sender_id, ciphertext, iv, status, created_at;
-        `;
-        const insertValues = [
-          messageId,
-          roomId,
-          effectiveUserId,
-          ciphertext,
-          iv,
-          createdAt || new Date().toISOString(),
-        ];
+      // Save to DB - adapt to your existing db call
+      // Ensure you preserve payload.username when saving
+      const savedMsg = await db.saveMessage({
+        messageId: payload.messageId,
+        roomId: payload.roomId,
+        senderId: payload.senderId,
+        username: payload.username || "Anon",
+        ciphertext: payload.ciphertext,
+        iv: payload.iv,
+        createdAt: payload.createdAt || new Date().toISOString(),
+        status: payload.status || "sent",
+      });
 
-        const insertRes = await pool.query(insertQ, insertValues);
-        const row = insertRes.rows[0];
+      // emit the raw message to everyone else in the room
+      socket.to(payload.roomId).emit("message", savedMsg);
 
-        // normalize payload and ensure username is present
-        const payload = normalizeMessageRow(row);
-        payload.username = payload.username || effectiveUsername;
-
-        // send encrypted message to others
-        socket.to(roomId).emit("message", payload);
-
-        // send DB-saved ack only to the original sender (no duplicate to other clients)
-        socket.emit("message-saved", payload);
-      } catch (err) {
-        console.error("send-message error", err);
-        socket.emit("send-error", { error: "db error", details: err.message });
-      }
+      // emit message-saved only to the original sender (ack + DB data)
+      socket.emit("message-saved", savedMsg);
+    } catch (err) {
+      console.error("error handling send-message:", err);
+      socket.emit("error", { message: "message save failed" });
     }
-  );
+  });
 
   // delivery receipt — update DB and notify the room
   socket.on("message-received", async ({ messageId, userId, roomId }) => {

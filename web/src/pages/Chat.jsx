@@ -160,18 +160,17 @@ export default function Chat() {
 
     socket = io(API, { transports: ["websocket", "polling"] });
 
-    socket.on("connect", () => {
+    // ensure that on every (re)connect we rejoin with the stored username
+    const onConnect = () => {
       const username = localStorage.getItem("username") || "Anon";
       socket.emit("join-room", { roomId, userId, username });
-      console.log(
-        "joined room",
-        roomId,
-        "userId",
-        userId,
-        "username",
-        username
-      );
-    });
+      console.log("joined room", roomId, "userId", userId, "username", username);
+    };
+
+    socket.on("connect", onConnect);
+
+    // if socket is already connected right away, call once
+    if (socket.connected) onConnect();
 
     socket.on("assign-user-id", ({ userId: serverUserId }) => {
       if (serverUserId) {
@@ -188,7 +187,8 @@ export default function Chat() {
         messageId: payload.messageId,
         roomId: payload.roomId,
         senderId: payload.senderId,
-        username: payload.username || "Anon",
+        username:
+          payload.username || localStorage.getItem("username") || "Anon",
         ciphertext,
         iv,
         status: payload.status || "sent",
@@ -228,14 +228,14 @@ export default function Chat() {
         return [...prev, normalized];
       });
 
-      // ACK delivered (unchanged)
+      // ACK delivered
       socket.emit("message-received", {
         messageId: normalized.messageId,
         userId,
         roomId,
       });
 
-      // Try decrypt right away if possible (unchanged)
+      // Try decrypt right away if possible
       if (key && normalized.ciphertext && normalized.iv) {
         try {
           const pt = await decryptText(
@@ -439,11 +439,13 @@ export default function Chat() {
     // encryptText returns base64 iv + ciphertext
     const { iv, ciphertext } = await encryptText(key, text);
 
+    const username = localStorage.getItem("username") || "Anon";
+
     const msg = {
       messageId,
       roomId,
       senderId: userId,
-      username: localStorage.getItem("username") || "Anon",
+      username,
       ciphertext,
       iv,
       createdAt,
@@ -451,15 +453,17 @@ export default function Chat() {
       status: "sending",
     };
 
+    // optimistic local echo
     setMessages((p) => [...p, msg]);
     setText("");
 
     try {
+      // NOTE: emit `senderId` (server expects senderId); keep the username field too
       socket.emit("send-message", {
         messageId,
         roomId,
-        userId,
-        username: localStorage.getItem("username") || "Anon",
+        senderId: userId,
+        username,
         ciphertext,
         iv,
         createdAt,
@@ -580,7 +584,8 @@ export default function Chat() {
           <div className="messages" ref={listRef}>
             {messages.map((msg, idx) => {
               const mine = msg.senderId === userId;
-              const username = msg.username || "Anon";
+              // prefer msg.username, but fallback to local stored username for safety
+              const username = msg.username || localStorage.getItem("username") || "Anon";
               const textToShow =
                 msg.plaintext ?? "Encrypted message (unlock to view)";
               const createdAt = msg.createdAt;
