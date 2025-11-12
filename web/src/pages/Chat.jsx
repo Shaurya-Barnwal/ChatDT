@@ -133,6 +133,7 @@ export default function Chat() {
 
     // incoming message (others)
     socket.on("message", async (payload) => {
+      // debug payload types — leave this for now, helps spot Buffer vs base64
       console.log(
         "incoming payload types:",
         typeof payload.iv,
@@ -160,16 +161,43 @@ export default function Chat() {
         createdAt: payload.createdAt,
       };
 
-      const exists = messagesRef.current.find(
+      // Deduplicate: first try to find by exact messageId
+      let merged = false;
+      const byId = messagesRef.current.find(
         (m) => m.messageId === normalized.messageId
       );
-      if (exists) {
+      if (byId) {
         setMessages((prev) =>
           prev.map((m) =>
             m.messageId === normalized.messageId ? { ...m, ...normalized } : m
           )
         );
+        merged = true;
       } else {
+        // If we don't have same id, try matching by senderId + ciphertext + iv (stable fingerprint of the message)
+        if (normalized.senderId && normalized.ciphertext && normalized.iv) {
+          const match = messagesRef.current.find(
+            (m) =>
+              m.senderId === normalized.senderId &&
+              m.ciphertext === normalized.ciphertext &&
+              m.iv === normalized.iv
+          );
+          if (match) {
+            // Merge into the existing optimistic message: keep its plaintext (if any),
+            // set the server-supplied messageId and update fields.
+            setMessages((prev) =>
+              prev.map((m) =>
+                m === match
+                  ? { ...m, ...normalized, messageId: normalized.messageId }
+                  : m
+              )
+            );
+            merged = true;
+          }
+        }
+      }
+
+      if (!merged) {
         setMessages((prev) => [...prev, normalized]);
       }
 
@@ -220,10 +248,11 @@ export default function Chat() {
         createdAt: payload.createdAt,
       };
 
-      const exists = messagesRef.current.find(
+      // If we already have a message with that id -> merge
+      const existsById = messagesRef.current.find(
         (m) => m.messageId === normalized.messageId
       );
-      if (exists) {
+      if (existsById) {
         setMessages((prev) =>
           prev.map((m) =>
             m.messageId === normalized.messageId
@@ -232,7 +261,31 @@ export default function Chat() {
           )
         );
       } else {
-        setMessages((prev) => [...prev, normalized]);
+        // Try to find and merge into optimistic message by sender + ciphertext + iv
+        let merged = false;
+        if (normalized.senderId && normalized.ciphertext && normalized.iv) {
+          const match = messagesRef.current.find(
+            (m) =>
+              m.senderId === normalized.senderId &&
+              m.ciphertext === normalized.ciphertext &&
+              m.iv === normalized.iv
+          );
+          if (match) {
+            // Replace/update optimistic message with server canonical payload and preserve plaintext if present
+            setMessages((prev) =>
+              prev.map((m) =>
+                m === match
+                  ? { ...m, ...normalized, messageId: normalized.messageId }
+                  : m
+              )
+            );
+            merged = true;
+          }
+        }
+
+        if (!merged) {
+          setMessages((prev) => [...prev, normalized]);
+        }
       }
 
       setStatusMap((m) => ({
