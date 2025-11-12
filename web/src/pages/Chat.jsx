@@ -2,7 +2,12 @@
 import React, { useEffect, useState, useRef } from "react";
 import { useParams } from "react-router-dom";
 import io from "socket.io-client";
-import { deriveKey, encryptText, decryptText, exportKeyBase64 } from "../utils/crypto";
+import {
+  deriveKey,
+  encryptText,
+  decryptText,
+  exportKeyBase64,
+} from "../utils/crypto";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:4000";
 let socket;
@@ -13,7 +18,12 @@ async function safeDecrypt(k, iv, ct) {
     if (!iv || !ct) throw new Error("missing iv or ciphertext");
     // helpful debug if non-strings arrive
     if (typeof iv !== "string" || typeof ct !== "string") {
-      console.warn("safeDecrypt: expected strings for iv/ciphertext; got types:", typeof iv, typeof ct, { iv, ct });
+      console.warn(
+        "safeDecrypt: expected strings for iv/ciphertext; got types:",
+        typeof iv,
+        typeof ct,
+        { iv, ct }
+      );
     }
     const pt = await decryptText(k, iv, ct);
     return pt;
@@ -107,7 +117,14 @@ export default function Chat() {
     socket.on("connect", () => {
       const username = localStorage.getItem("username") || "Anon";
       socket.emit("join-room", { roomId, userId, username });
-      console.log("joined room", roomId, "userId", userId, "username", username);
+      console.log(
+        "joined room",
+        roomId,
+        "userId",
+        userId,
+        "username",
+        username
+      );
     });
 
     socket.on("assign-user-id", ({ userId: serverUserId }) => {
@@ -118,6 +135,21 @@ export default function Chat() {
 
     // handle incoming messages from *other* users
     socket.on("message", async (payload) => {
+      console.log(
+        "incoming payload types:",
+        typeof payload.iv,
+        typeof payload.ciphertext,
+        payload.iv && payload.iv.slice
+          ? payload.iv.slice(0, 12)
+          : payload.iv && payload.iv.data
+          ? "(Buffer data len=" + payload.iv.data.length + ")"
+          : payload.iv,
+        payload.ciphertext && payload.ciphertext.slice
+          ? payload.ciphertext.slice(0, 12)
+          : payload.ciphertext && payload.ciphertext.data
+          ? "(Buffer data len=" + payload.ciphertext.data.length + ")"
+          : payload.ciphertext
+      );
       const normalized = {
         messageId: payload.messageId,
         roomId: payload.roomId,
@@ -129,9 +161,15 @@ export default function Chat() {
         createdAt: payload.createdAt,
       };
 
-      const exists = messagesRef.current.find((m) => m.messageId === normalized.messageId);
+      const exists = messagesRef.current.find(
+        (m) => m.messageId === normalized.messageId
+      );
       if (exists) {
-        setMessages((prev) => prev.map((m) => (m.messageId === normalized.messageId ? { ...m, ...normalized } : m)));
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.messageId === normalized.messageId ? { ...m, ...normalized } : m
+          )
+        );
       } else {
         setMessages((prev) => [...prev, normalized]);
       }
@@ -146,8 +184,16 @@ export default function Chat() {
       // Try to decrypt if we have the key
       if (key && normalized.ciphertext && normalized.iv) {
         try {
-          const pt = await decryptText(key, normalized.iv, normalized.ciphertext);
-          setMessages((prev) => prev.map((m) => (m.messageId === normalized.messageId ? { ...m, plaintext: pt } : m)));
+          const pt = await decryptText(
+            key,
+            normalized.iv,
+            normalized.ciphertext
+          );
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.messageId === normalized.messageId ? { ...m, plaintext: pt } : m
+            )
+          );
 
           // ACK read
           socket.emit("message-read", {
@@ -167,28 +213,48 @@ export default function Chat() {
         messageId: payload.messageId,
         roomId: payload.roomId,
         senderId: payload.senderId,
-        username: payload.username || localStorage.getItem("username") || "Anon",
+        username:
+          payload.username || localStorage.getItem("username") || "Anon",
         ciphertext: payload.ciphertext,
         iv: payload.iv,
         status: payload.status || "sent",
         createdAt: payload.createdAt,
       };
 
-      const exists = messagesRef.current.find((m) => m.messageId === normalized.messageId);
+      const exists = messagesRef.current.find(
+        (m) => m.messageId === normalized.messageId
+      );
       if (exists) {
-        setMessages((prev) => prev.map((m) => (m.messageId === normalized.messageId ? { ...m, ...normalized, plaintext: m.plaintext } : m)));
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.messageId === normalized.messageId
+              ? { ...m, ...normalized, plaintext: m.plaintext }
+              : m
+          )
+        );
       } else {
         setMessages((prev) => [...prev, normalized]);
       }
 
-      setStatusMap((m) => ({ ...m, [normalized.messageId]: normalized.status }));
+      setStatusMap((m) => ({
+        ...m,
+        [normalized.messageId]: normalized.status,
+      }));
 
       // If this client is the sender and we have key, attempt to decrypt
       const isMine = normalized.senderId === userId;
       if (isMine && key && normalized.ciphertext && normalized.iv) {
         try {
-          const pt = await decryptText(key, normalized.iv, normalized.ciphertext);
-          setMessages((prev) => prev.map((m) => (m.messageId === normalized.messageId ? { ...m, plaintext: pt } : m)));
+          const pt = await decryptText(
+            key,
+            normalized.iv,
+            normalized.ciphertext
+          );
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.messageId === normalized.messageId ? { ...m, plaintext: pt } : m
+            )
+          );
         } catch (err) {
           console.warn("decrypt failed on message-saved for own message", err);
         }
@@ -197,7 +263,11 @@ export default function Chat() {
 
     socket.on("message-status-update", ({ messageId, status }) => {
       setStatusMap((m) => ({ ...m, [messageId]: status }));
-      setMessages((prev) => prev.map((msg) => (msg.messageId === messageId ? { ...msg, status } : msg)));
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.messageId === messageId ? { ...msg, status } : msg
+        )
+      );
     });
 
     socket.on("send-error", (err) => {
@@ -212,7 +282,6 @@ export default function Chat() {
       }
       socket = null;
     };
-
   }, [key, roomId, userId, showNamePrompt]);
 
   // unlock now trims passphrase and roomId and exports a short fingerprint for debugging
@@ -244,7 +313,8 @@ export default function Chat() {
         for (const m of messagesRef.current) {
           if (!m.plaintext && m.ciphertext && m.iv) {
             const pt = await safeDecrypt(k, m.iv, m.ciphertext);
-            if (pt !== null) toUpdate.push({ messageId: m.messageId, plaintext: pt });
+            if (pt !== null)
+              toUpdate.push({ messageId: m.messageId, plaintext: pt });
           }
         }
         if (toUpdate.length > 0) {
@@ -258,15 +328,22 @@ export default function Chat() {
       }
     } catch (err) {
       // improved debug logging instead of bare "err"
-      console.error("deriveKey failed:", err && err.message ? err.message : err);
+      console.error(
+        "deriveKey failed:",
+        err && err.message ? err.message : err
+      );
       console.groupCollapsed("deriveKey debug");
       console.log("passphrase length:", (passphrase || "").length);
       console.log("roomId (raw):", roomId);
       console.log("roomId (stringified):", JSON.stringify(roomId));
-      console.log("Tip: ensure both clients use the exact same passphrase and roomId (no leading/trailing spaces).");
+      console.log(
+        "Tip: ensure both clients use the exact same passphrase and roomId (no leading/trailing spaces)."
+      );
       console.groupEnd();
 
-      alert("Failed to derive key. Check passphrase and room id; see console for details.");
+      alert(
+        "Failed to derive key. Check passphrase and room id; see console for details."
+      );
       setKey(null);
     }
   };
@@ -307,7 +384,11 @@ export default function Chat() {
       });
     } catch (err) {
       console.error("emit send-message failed", err);
-      setMessages((prev) => prev.map((m) => (m.messageId === messageId ? { ...m, status: "failed" } : m)));
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.messageId === messageId ? { ...m, status: "failed" } : m
+        )
+      );
     }
   };
 
@@ -423,7 +504,8 @@ export default function Chat() {
             {messages.map((msg, idx) => {
               const mine = msg.senderId === userId;
               const username = msg.username || "Anon";
-              const textToShow = msg.plaintext ?? "Encrypted message (unlock to view)";
+              const textToShow =
+                msg.plaintext ?? "Encrypted message (unlock to view)";
               const createdAt = msg.createdAt;
 
               return (
@@ -432,7 +514,9 @@ export default function Chat() {
                   className={`msg-row ${mine ? "mine" : "theirs"}`}
                 >
                   <div
-                    className={`bubble ${mine ? "bubble-mine" : "bubble-theirs"}`}
+                    className={`bubble ${
+                      mine ? "bubble-mine" : "bubble-theirs"
+                    }`}
                   >
                     {!mine && (
                       <div
@@ -449,7 +533,9 @@ export default function Chat() {
                     <div className="msg-text">{textToShow}</div>
                     <div className="msg-meta">
                       <div className="time">
-                        {createdAt ? new Date(createdAt).toLocaleTimeString() : ""}
+                        {createdAt
+                          ? new Date(createdAt).toLocaleTimeString()
+                          : ""}
                       </div>
                       <div className="tick-wrap">{renderTick(msg)}</div>
                     </div>

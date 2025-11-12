@@ -4,7 +4,6 @@ const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
 function toBase64(buf) {
-  // buf: ArrayBuffer or Uint8Array
   const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
   let binary = "";
   for (let i = 0; i < bytes.byteLength; i++) {
@@ -23,12 +22,30 @@ function fromBase64(b64) {
   return bytes.buffer;
 }
 
+// Accept many input shapes for iv/ciphertext:
+// - base64 string
+// - Buffer-like object { type: "Buffer", data: [...] }
+// - Uint8Array or ArrayBuffer
+function normalizeToArrayBuffer(input) {
+  if (!input && input !== 0) return null;
+  // already ArrayBuffer or TypedArray
+  if (input instanceof ArrayBuffer) return input;
+  if (ArrayBuffer.isView(input)) return input.buffer;
+  // If it's a Buffer-like object from JSON (e.g. { type: "Buffer", data: [...] })
+  if (typeof input === "object" && Array.isArray(input.data)) {
+    return new Uint8Array(input.data).buffer;
+  }
+  // If it's a base64 string
+  if (typeof input === "string") {
+    return fromBase64(input);
+  }
+  // Unknown shape: try to JSON inspect
+  throw new Error("Unsupported input type for crypto normalizer: " + typeof input);
+}
+
 export async function deriveKey(passphrase, roomId) {
-  // passphrase: string
-  // roomId: string (used as salt)
-  // returns an AES-GCM CryptoKey
-  const passBytes = textEncoder.encode(passphrase);
-  const salt = textEncoder.encode(roomId || "default-room");
+  const passBytes = textEncoder.encode(String(passphrase || ""));
+  const salt = textEncoder.encode(String(roomId || "default-room"));
   const baseKey = await crypto.subtle.importKey(
     "raw",
     passBytes,
@@ -37,7 +54,8 @@ export async function deriveKey(passphrase, roomId) {
     ["deriveKey"]
   );
 
-  // 200k iterations — reasonable for client KDF. Can lower if too slow.
+  // NOTE: make extractable=true so exportKeyBase64 can export raw bytes for fingerprinting.
+  // If you want to lock this down later, set extractable=false (but then exportKeyBase64 won't work).
   const key = await crypto.subtle.deriveKey(
     {
       name: "PBKDF2",
@@ -47,7 +65,7 @@ export async function deriveKey(passphrase, roomId) {
     },
     baseKey,
     { name: "AES-GCM", length: 256 },
-    false,
+    true, // <--- extractable true (so we can export for fingerprint/debug)
     ["encrypt", "decrypt"]
   );
 
@@ -55,9 +73,7 @@ export async function deriveKey(passphrase, roomId) {
 }
 
 export async function encryptText(key, plainText) {
-  // key: CryptoKey from deriveKey
-  // plainText: string
-  const iv = crypto.getRandomValues(new Uint8Array(12)); // 96-bit IV recommended for AES-GCM
+  const iv = crypto.getRandomValues(new Uint8Array(12)); // 12 bytes IV
   const pt = textEncoder.encode(plainText);
   const cipherBuffer = await crypto.subtle.encrypt(
     { name: "AES-GCM", iv },
@@ -70,12 +86,11 @@ export async function encryptText(key, plainText) {
   };
 }
 
-export async function decryptText(key, ivBase64, ciphertextBase64) {
-  // Note the signature: (key, iv, ciphertext)
-  // ivBase64 & ciphertextBase64 are base64 strings
-  const ivBuf = fromBase64(ivBase64);
-  const cipherBuf = fromBase64(ciphertextBase64);
+export async function decryptText(key, ivInput, ciphertextInput) {
+  // accepts iv/ciphertext as base64 OR Buffer-like object OR ArrayBuffer/Uint8Array
   try {
+    const ivBuf = normalizeToArrayBuffer(ivInput);
+    const cipherBuf = normalizeToArrayBuffer(ciphertextInput);
     const plainBuf = await crypto.subtle.decrypt(
       { name: "AES-GCM", iv: new Uint8Array(ivBuf) },
       key,
@@ -83,12 +98,13 @@ export async function decryptText(key, ivBase64, ciphertextBase64) {
     );
     return textDecoder.decode(new Uint8Array(plainBuf));
   } catch (err) {
-    // bubble up error for caller to log
-    throw new Error("decrypt failed: " + err.message);
+    // rethrow with more context for easier debugging
+    throw new Error("decrypt failed: " + (err && err.message ? err.message : String(err)));
   }
 }
 
 // Helper: export raw key bytes (for fingerprinting)
+// May fail if key isn't extractable; callers should catch.
 export async function exportKeyBase64(key) {
   const raw = await crypto.subtle.exportKey("raw", key);
   return toBase64(raw);
