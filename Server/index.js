@@ -290,11 +290,11 @@ io.on("connection", (socket) => {
         const payload = normalizeMessageRow(row);
         payload.username = payload.username || effectiveUsername;
 
-        // Broadcast encrypted message to everyone in the room EXCEPT the sender
+        // send encrypted message to others
         socket.to(roomId).emit("message", payload);
 
-        // Notify the room (including sender) that message was saved in DB
-        io.to(roomId).emit("message-saved", payload);
+        // send DB-saved ack only to the original sender (no duplicate to other clients)
+        socket.emit("message-saved", payload);
       } catch (err) {
         console.error("send-message error", err);
         socket.emit("send-error", { error: "db error", details: err.message });

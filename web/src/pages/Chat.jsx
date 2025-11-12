@@ -181,7 +181,6 @@ export default function Chat() {
 
     // incoming message (others)
     socket.on("message", async (payload) => {
-      // normalize iv/ciphertext to base64 up-front (handles server Buffer-like shapes)
       const iv = normalizeToBase64(payload.iv);
       const ciphertext = normalizeToBase64(payload.ciphertext);
 
@@ -196,51 +195,47 @@ export default function Chat() {
         createdAt: payload.createdAt,
       };
 
-      // Deduplicate by messageId first, else by sender+iv+ciphertext
-      let merged = false;
-      const byId = messagesRef.current.find(
-        (m) => m.messageId === normalized.messageId
-      );
-      if (byId) {
-        setMessages((prev) =>
-          prev.map((m) =>
+      // Use functional update to atomically check & merge
+      setMessages((prev) => {
+        // dedupe by messageId
+        const byId = prev.find((m) => m.messageId === normalized.messageId);
+        if (byId) {
+          return prev.map((m) =>
             m.messageId === normalized.messageId ? { ...m, ...normalized } : m
-          )
-        );
-        merged = true;
-      } else if (
-        normalized.senderId &&
-        normalized.ciphertext &&
-        normalized.iv
-      ) {
-        const match = messagesRef.current.find(
-          (m) =>
-            m.senderId === normalized.senderId &&
-            m.ciphertext === normalized.ciphertext &&
-            m.iv === normalized.iv
-        );
-        if (match) {
-          setMessages((prev) =>
-            prev.map((m) =>
-              m === match
-                ? { ...m, ...normalized, messageId: normalized.messageId }
-                : m
-            )
           );
-          merged = true;
         }
-      }
 
-      if (!merged) setMessages((prev) => [...prev, normalized]);
+        // else dedupe by sender+ct+iv (optimistic match)
+        if (normalized.senderId && normalized.ciphertext && normalized.iv) {
+          const matchIdx = prev.findIndex(
+            (m) =>
+              m.senderId === normalized.senderId &&
+              m.ciphertext === normalized.ciphertext &&
+              m.iv === normalized.iv
+          );
+          if (matchIdx !== -1) {
+            const copy = prev.slice();
+            copy[matchIdx] = {
+              ...copy[matchIdx],
+              ...normalized,
+              messageId: normalized.messageId,
+            };
+            return copy;
+          }
+        }
 
-      // ACK delivered
+        // nothing matched -> append
+        return [...prev, normalized];
+      });
+
+      // ACK delivered (unchanged)
       socket.emit("message-received", {
         messageId: normalized.messageId,
         userId,
         roomId,
       });
 
-      // Try to decrypt if we have the key
+      // Try decrypt right away if possible (unchanged)
       if (key && normalized.ciphertext && normalized.iv) {
         try {
           const pt = await decryptText(
@@ -254,7 +249,6 @@ export default function Chat() {
             )
           );
 
-          // ACK read
           socket.emit("message-read", {
             messageId: normalized.messageId,
             userId,
@@ -283,48 +277,46 @@ export default function Chat() {
         createdAt: payload.createdAt,
       };
 
-      // merge by messageId
-      const existsById = messagesRef.current.find(
-        (m) => m.messageId === normalized.messageId
-      );
-      if (existsById) {
-        setMessages((prev) =>
-          prev.map((m) =>
+      // atomic merge using previous messages
+      setMessages((prev) => {
+        const existsById = prev.find(
+          (m) => m.messageId === normalized.messageId
+        );
+        if (existsById) {
+          return prev.map((m) =>
             m.messageId === normalized.messageId
               ? { ...m, ...normalized, plaintext: m.plaintext }
               : m
-          )
-        );
-      } else {
-        // else try to match optimistic by sender+ciphertext+iv
-        let merged = false;
-        if (normalized.senderId && normalized.ciphertext && normalized.iv) {
-          const match = messagesRef.current.find(
-            (m) =>
-              m.senderId === normalized.senderId &&
-              m.ciphertext === normalized.ciphertext &&
-              m.iv === normalized.iv
           );
-          if (match) {
-            setMessages((prev) =>
-              prev.map((m) =>
-                m === match
-                  ? { ...m, ...normalized, messageId: normalized.messageId }
-                  : m
-              )
+        } else {
+          // attempt optimistic match by sender+ciphertext+iv
+          if (normalized.senderId && normalized.ciphertext && normalized.iv) {
+            const matchIdx = prev.findIndex(
+              (m) =>
+                m.senderId === normalized.senderId &&
+                m.ciphertext === normalized.ciphertext &&
+                m.iv === normalized.iv
             );
-            merged = true;
+            if (matchIdx !== -1) {
+              const copy = prev.slice();
+              copy[matchIdx] = {
+                ...copy[matchIdx],
+                ...normalized,
+                messageId: normalized.messageId,
+              };
+              return copy;
+            }
           }
+          return [...prev, normalized];
         }
-        if (!merged) setMessages((prev) => [...prev, normalized]);
-      }
+      });
 
       setStatusMap((m) => ({
         ...m,
         [normalized.messageId]: normalized.status,
       }));
 
-      // If this client is the sender and we have key, attempt to decrypt
+      // If this message is mine and we have the key, decrypt and set plaintext
       const isMine = normalized.senderId === userId;
       if (isMine && key && normalized.ciphertext && normalized.iv) {
         try {
