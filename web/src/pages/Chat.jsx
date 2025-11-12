@@ -12,19 +12,63 @@ import {
 const API = import.meta.env.VITE_API_URL || "http://localhost:4000";
 let socket;
 
-// safeDecrypt helper
+// helper: convert ArrayBuffer/Uint8Array to base64
+function arrayBufferToBase64(buf) {
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  let binary = "";
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+// normalize various payload shapes (string base64, ArrayBuffer, { data: [...] }, Buffer-like) -> base64 string
+function normalizeToBase64(val) {
+  if (!val && val !== "") return val;
+  if (typeof val === "string") return val;
+
+  // TypedArray / ArrayBuffer
+  if (val instanceof ArrayBuffer)
+    return arrayBufferToBase64(new Uint8Array(val));
+  if (ArrayBuffer.isView(val)) return arrayBufferToBase64(val);
+
+  // Node-style buffer objects: { type: 'Buffer', data: [...] } or { data: [...] }
+  if (val && typeof val === "object") {
+    if (Array.isArray(val.data)) {
+      return arrayBufferToBase64(new Uint8Array(val.data));
+    }
+    // some Socket->browser transfers can come as plain object with numeric keys -> try to collect numeric values
+    const numericVals = [];
+    for (const k of Object.keys(val)) {
+      const v = val[k];
+      if (typeof v === "number") numericVals.push(v);
+    }
+    if (numericVals.length > 0) {
+      return arrayBufferToBase64(new Uint8Array(numericVals));
+    }
+  }
+
+  // fallback: return as-is (will likely fail decrypt, but avoid crashing)
+  return val;
+}
+
+// safeDecrypt helper: returns plaintext or null
 async function safeDecrypt(k, iv, ct) {
   try {
     if (!iv || !ct) throw new Error("missing iv or ciphertext");
-    if (typeof iv !== "string" || typeof ct !== "string") {
-      console.warn(
-        "safeDecrypt: expected strings for iv/ciphertext; got types:",
-        typeof iv,
-        typeof ct,
-        { iv, ct }
-      );
+    // normalize to base64 strings if caller passed non-strings
+    const ivB64 = normalizeToBase64(iv);
+    const ctB64 = normalizeToBase64(ct);
+
+    if (typeof ivB64 !== "string" || typeof ctB64 !== "string") {
+      console.warn("safeDecrypt: iv/ct not strings after normalization", {
+        ivB64,
+        ctB64,
+      });
+      throw new Error("iv/ciphertext normalization failed");
     }
-    const pt = await decryptText(k, iv, ct);
+
+    const pt = await decryptText(k, ivB64, ctB64);
     return pt;
   } catch (err) {
     console.warn("safeDecrypt failed:", err && err.message ? err.message : err);
@@ -84,23 +128,27 @@ export default function Chat() {
     }
   }, [messages.length]);
 
-  // load previous messages
+  // load previous messages - normalize iv/ciphertext to base64
   useEffect(() => {
     if (!roomId) return;
     fetch(`${API}/rooms/${roomId}/messages`)
       .then((r) => r.json())
       .then((data) => {
-        const normalized = (Array.isArray(data) ? data : []).map((m) => ({
-          messageId: m.messageId || m.message_id,
-          roomId: m.roomId || m.room_id,
-          senderId: m.senderId || m.sender_id,
-          username: m.username || m.name || "Anon",
-          ciphertext: m.ciphertext,
-          iv: m.iv,
-          status: m.status || "sent",
-          createdAt: m.createdAt || m.created_at,
-          plaintext: m.plaintext || undefined,
-        }));
+        const normalized = (Array.isArray(data) ? data : []).map((m) => {
+          const iv = normalizeToBase64(m.iv);
+          const ciphertext = normalizeToBase64(m.ciphertext);
+          return {
+            messageId: m.messageId || m.message_id,
+            roomId: m.roomId || m.room_id,
+            senderId: m.senderId || m.sender_id,
+            username: m.username || m.name || "Anon",
+            ciphertext,
+            iv,
+            status: m.status || "sent",
+            createdAt: m.createdAt || m.created_at,
+            plaintext: m.plaintext || undefined,
+          };
+        });
         setMessages(normalized);
       })
       .catch(console.error);
@@ -133,35 +181,22 @@ export default function Chat() {
 
     // incoming message (others)
     socket.on("message", async (payload) => {
-      // debug payload types — leave this for now, helps spot Buffer vs base64
-      console.log(
-        "incoming payload types:",
-        typeof payload.iv,
-        typeof payload.ciphertext,
-        payload.iv && payload.iv.slice
-          ? payload.iv.slice(0, 12)
-          : payload.iv && payload.iv.data
-          ? "(Buffer data len=" + payload.iv.data.length + ")"
-          : payload.iv,
-        payload.ciphertext && payload.ciphertext.slice
-          ? payload.ciphertext.slice(0, 12)
-          : payload.ciphertext && payload.ciphertext.data
-          ? "(Buffer data len=" + payload.ciphertext.data.length + ")"
-          : payload.ciphertext
-      );
+      // normalize iv/ciphertext to base64 up-front (handles server Buffer-like shapes)
+      const iv = normalizeToBase64(payload.iv);
+      const ciphertext = normalizeToBase64(payload.ciphertext);
 
       const normalized = {
         messageId: payload.messageId,
         roomId: payload.roomId,
         senderId: payload.senderId,
         username: payload.username || "Anon",
-        ciphertext: payload.ciphertext,
-        iv: payload.iv,
+        ciphertext,
+        iv,
         status: payload.status || "sent",
         createdAt: payload.createdAt,
       };
 
-      // Deduplicate: first try to find by exact messageId
+      // Deduplicate by messageId first, else by sender+iv+ciphertext
       let merged = false;
       const byId = messagesRef.current.find(
         (m) => m.messageId === normalized.messageId
@@ -173,33 +208,30 @@ export default function Chat() {
           )
         );
         merged = true;
-      } else {
-        // If we don't have same id, try matching by senderId + ciphertext + iv (stable fingerprint of the message)
-        if (normalized.senderId && normalized.ciphertext && normalized.iv) {
-          const match = messagesRef.current.find(
-            (m) =>
-              m.senderId === normalized.senderId &&
-              m.ciphertext === normalized.ciphertext &&
-              m.iv === normalized.iv
+      } else if (
+        normalized.senderId &&
+        normalized.ciphertext &&
+        normalized.iv
+      ) {
+        const match = messagesRef.current.find(
+          (m) =>
+            m.senderId === normalized.senderId &&
+            m.ciphertext === normalized.ciphertext &&
+            m.iv === normalized.iv
+        );
+        if (match) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m === match
+                ? { ...m, ...normalized, messageId: normalized.messageId }
+                : m
+            )
           );
-          if (match) {
-            // Merge into the existing optimistic message: keep its plaintext (if any),
-            // set the server-supplied messageId and update fields.
-            setMessages((prev) =>
-              prev.map((m) =>
-                m === match
-                  ? { ...m, ...normalized, messageId: normalized.messageId }
-                  : m
-              )
-            );
-            merged = true;
-          }
+          merged = true;
         }
       }
 
-      if (!merged) {
-        setMessages((prev) => [...prev, normalized]);
-      }
+      if (!merged) setMessages((prev) => [...prev, normalized]);
 
       // ACK delivered
       socket.emit("message-received", {
@@ -234,21 +266,24 @@ export default function Chat() {
       }
     });
 
-    // message-saved: server ack for messages YOU sent
+    // message-saved (server ack for messages you sent)
     socket.on("message-saved", async (payload) => {
+      const iv = normalizeToBase64(payload.iv);
+      const ciphertext = normalizeToBase64(payload.ciphertext);
+
       const normalized = {
         messageId: payload.messageId,
         roomId: payload.roomId,
         senderId: payload.senderId,
         username:
           payload.username || localStorage.getItem("username") || "Anon",
-        ciphertext: payload.ciphertext,
-        iv: payload.iv,
+        ciphertext,
+        iv,
         status: payload.status || "sent",
         createdAt: payload.createdAt,
       };
 
-      // If we already have a message with that id -> merge
+      // merge by messageId
       const existsById = messagesRef.current.find(
         (m) => m.messageId === normalized.messageId
       );
@@ -261,7 +296,7 @@ export default function Chat() {
           )
         );
       } else {
-        // Try to find and merge into optimistic message by sender + ciphertext + iv
+        // else try to match optimistic by sender+ciphertext+iv
         let merged = false;
         if (normalized.senderId && normalized.ciphertext && normalized.iv) {
           const match = messagesRef.current.find(
@@ -271,7 +306,6 @@ export default function Chat() {
               m.iv === normalized.iv
           );
           if (match) {
-            // Replace/update optimistic message with server canonical payload and preserve plaintext if present
             setMessages((prev) =>
               prev.map((m) =>
                 m === match
@@ -282,10 +316,7 @@ export default function Chat() {
             merged = true;
           }
         }
-
-        if (!merged) {
-          setMessages((prev) => [...prev, normalized]);
-        }
+        if (!merged) setMessages((prev) => [...prev, normalized]);
       }
 
       setStatusMap((m) => ({
@@ -334,7 +365,7 @@ export default function Chat() {
       }
       socket = null;
     };
-  }, [key, roomId, userId, showNamePrompt]); // re-init when key changes
+  }, [key, roomId, userId, showNamePrompt]);
 
   // unlock: derive key, compute fingerprint, decrypt loaded messages
   const unlock = async () => {
@@ -346,7 +377,7 @@ export default function Chat() {
       const k = await deriveKey(passTrim, roomTrim);
       setKey(k);
 
-      // compute a non-secret fingerprint from passphrase+roomId (no key export)
+      // compute fingerprint
       try {
         if (typeof computeFingerprint === "function") {
           const fp = await computeFingerprint(passTrim, roomTrim);
@@ -354,7 +385,7 @@ export default function Chat() {
           try {
             window._chatFingerprint = fp;
           } catch {
-            // ignore if not writable
+            // ignore
           }
           console.log("Derived fingerprint (first 12 chars):", fp);
         } else {
@@ -369,7 +400,7 @@ export default function Chat() {
         );
       }
 
-      // attempt to decrypt any messages already loaded
+      // attempt to decrypt loaded messages
       if (messagesRef.current && messagesRef.current.length > 0) {
         const toUpdate = [];
         for (const m of messagesRef.current) {
@@ -397,9 +428,6 @@ export default function Chat() {
       console.log("passphrase length:", (passphrase || "").length);
       console.log("roomId (raw):", roomId);
       console.log("roomId (stringified):", JSON.stringify(roomId));
-      console.log(
-        "Tip: ensure both clients use the exact same passphrase and roomId (no leading/trailing spaces)."
-      );
       console.groupEnd();
 
       alert(
@@ -416,6 +444,7 @@ export default function Chat() {
 
     const messageId = window.crypto.randomUUID();
     const createdAt = new Date().toISOString();
+    // encryptText returns base64 iv + ciphertext
     const { iv, ciphertext } = await encryptText(key, text);
 
     const msg = {
@@ -506,7 +535,6 @@ export default function Chat() {
               >
                 Continue as Anon
               </button>
-
               <button
                 onClick={submitName}
                 style={{
