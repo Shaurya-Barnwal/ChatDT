@@ -6,17 +6,16 @@ import {
   deriveKey,
   encryptText,
   decryptText,
-  exportKeyBase64,
+  computeFingerprint,
 } from "../utils/crypto";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:4000";
 let socket;
 
-// safeDecrypt helper (placed near top, below imports)
+// safeDecrypt helper
 async function safeDecrypt(k, iv, ct) {
   try {
     if (!iv || !ct) throw new Error("missing iv or ciphertext");
-    // helpful debug if non-strings arrive
     if (typeof iv !== "string" || typeof ct !== "string") {
       console.warn(
         "safeDecrypt: expected strings for iv/ciphertext; got types:",
@@ -27,8 +26,8 @@ async function safeDecrypt(k, iv, ct) {
     }
     const pt = await decryptText(k, iv, ct);
     return pt;
-  } catch (e) {
-    console.warn("safeDecrypt failed:", e && e.message ? e.message : e);
+  } catch (err) {
+    console.warn("safeDecrypt failed:", err && err.message ? err.message : err);
     return null;
   }
 }
@@ -91,7 +90,6 @@ export default function Chat() {
     fetch(`${API}/rooms/${roomId}/messages`)
       .then((r) => r.json())
       .then((data) => {
-        // ensure normalization on incoming list
         const normalized = (Array.isArray(data) ? data : []).map((m) => ({
           messageId: m.messageId || m.message_id,
           roomId: m.roomId || m.room_id,
@@ -133,7 +131,7 @@ export default function Chat() {
       }
     });
 
-    // handle incoming messages from *other* users
+    // incoming message (others)
     socket.on("message", async (payload) => {
       console.log(
         "incoming payload types:",
@@ -150,6 +148,7 @@ export default function Chat() {
           ? "(Buffer data len=" + payload.ciphertext.data.length + ")"
           : payload.ciphertext
       );
+
       const normalized = {
         messageId: payload.messageId,
         roomId: payload.roomId,
@@ -207,7 +206,7 @@ export default function Chat() {
       }
     });
 
-    // message-saved: canonical ack for messages YOU SENT.
+    // message-saved: server ack for messages YOU sent
     socket.on("message-saved", async (payload) => {
       const normalized = {
         messageId: payload.messageId,
@@ -282,9 +281,9 @@ export default function Chat() {
       }
       socket = null;
     };
-  }, [key, roomId, userId, showNamePrompt]);
+  }, [key, roomId, userId, showNamePrompt]); // re-init when key changes
 
-  // unlock now trims passphrase and roomId and exports a short fingerprint for debugging
+  // unlock: derive key, compute fingerprint, decrypt loaded messages
   const unlock = async () => {
     if (!passphrase) return alert("Enter passphrase");
     const passTrim = (passphrase || "").trim();
@@ -294,17 +293,27 @@ export default function Chat() {
       const k = await deriveKey(passTrim, roomTrim);
       setKey(k);
 
-      // expose key for quick console tests and export fingerprint if available
+      // compute a non-secret fingerprint from passphrase+roomId (no key export)
       try {
-        window._chatKey = k;
-        if (typeof exportKeyBase64 === "function") {
-          const exported = await exportKeyBase64(k);
-          const short = exported ? exported.slice(0, 12) : null;
-          setKeyFingerprint(short);
-          console.log("Derived key fingerprint (first 12 chars):", short);
+        if (typeof computeFingerprint === "function") {
+          const fp = await computeFingerprint(passTrim, roomTrim);
+          setKeyFingerprint(fp);
+          try {
+            window._chatFingerprint = fp;
+          } catch {
+            // ignore if not writable
+          }
+          console.log("Derived fingerprint (first 12 chars):", fp);
+        } else {
+          console.warn(
+            "computeFingerprint not available; ensure it's imported from ../utils/crypto"
+          );
         }
-      } catch (e) {
-        console.warn("exportKeyBase64 failed:", e && e.message ? e.message : e);
+      } catch (err) {
+        console.warn(
+          "computeFingerprint failed:",
+          err && err.message ? err.message : err
+        );
       }
 
       // attempt to decrypt any messages already loaded
@@ -327,7 +336,6 @@ export default function Chat() {
         }
       }
     } catch (err) {
-      // improved debug logging instead of bare "err"
       console.error(
         "deriveKey failed:",
         err && err.message ? err.message : err
@@ -435,11 +443,7 @@ export default function Chat() {
               style={{ width: "100%", padding: 8, marginBottom: 12 }}
             />
             <div
-              style={{
-                display: "flex",
-                justifyContent: "flex-end",
-                gap: 8,
-              }}
+              style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}
             >
               <button
                 onClick={() => {

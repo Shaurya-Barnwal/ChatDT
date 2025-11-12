@@ -44,6 +44,29 @@ const pool = new Pool({
     process.env.DATABASE_URL || "postgres://postgres:pass@localhost:5432/chat",
 });
 
+// --- add helper near top ---
+function ensureBase64Field(val) {
+  // val may be: Buffer (node), { type: 'Buffer', data: [...] } (JSONed), or already a base64 string
+  if (!val && val !== 0) return null;
+  // node Buffer
+  if (Buffer.isBuffer(val)) return val.toString("base64");
+  // Buffer-like object from JSON (e.g. { type: 'Buffer', data: [...] })
+  if (typeof val === "object" && Array.isArray(val.data))
+    return Buffer.from(val.data).toString("base64");
+  // if someone already stored base64 text -> return as-is
+  if (typeof val === "string") {
+    // optional: detect if it's hex or raw and handle — but assume base64 string if it decodes fine
+    return val;
+  }
+  // fallback: try to stringify
+  try {
+    return Buffer.from(JSON.stringify(val)).toString("base64");
+  } catch (e) {
+    return null;
+  }
+}
+// --- end helper ---
+
 // health
 app.get("/", (req, res) => {
   res.json({ ok: true, timestamp: new Date().toISOString() });
@@ -86,15 +109,9 @@ app.get("/rooms/:roomId/messages", async (req, res) => {
       roomId: r.room_id,
       senderId: r.sender_id,
       username: r.username || "Anon",
-      // ciphertext/iv might already be text or Buffer — convert to base64 string if Buffer
-      ciphertext:
-        r.ciphertext && typeof r.ciphertext.toString === "function"
-          ? r.ciphertext.toString("base64")
-          : r.ciphertext,
-      iv:
-        r.iv && typeof r.iv.toString === "function"
-          ? r.iv.toString("base64")
-          : r.iv,
+      // use helper to ensure base64 string
+      ciphertext: ensureBase64Field(r.ciphertext),
+      iv: ensureBase64Field(r.iv),
       status: r.status,
       deliveredAt: r.delivered_at,
       readAt: r.read_at,
@@ -121,15 +138,24 @@ io.on("connection", (socket) => {
     try {
       if (userId) {
         // Try find by id first
-        const sel = await pool.query("SELECT id, COALESCE(username, name) AS username FROM users WHERE id = $1", [userId]);
+        const sel = await pool.query(
+          "SELECT id, COALESCE(username, name) AS username FROM users WHERE id = $1",
+          [userId]
+        );
         if (sel.rowCount > 0) {
           // optionally update username if different
           const existing = sel.rows[0];
           if ((existing.username || "") !== username) {
             try {
-              await pool.query("UPDATE users SET username = $1 WHERE id = $2", [username, userId]);
+              await pool.query("UPDATE users SET username = $1 WHERE id = $2", [
+                username,
+                userId,
+              ]);
             } catch (updErr) {
-              console.warn("could not update username for existing id:", updErr.message);
+              console.warn(
+                "could not update username for existing id:",
+                updErr.message
+              );
             }
           }
           return { id: existing.id, username: username || existing.username };
@@ -143,14 +169,20 @@ io.on("connection", (socket) => {
             if (ins.rowCount > 0) return ins.rows[0];
           } catch (insErr) {
             // possibly unique/constraint error — fallback to select by username
-            console.warn("insert user by id failed, falling back to username lookup:", insErr.message);
+            console.warn(
+              "insert user by id failed, falling back to username lookup:",
+              insErr.message
+            );
           }
         }
       }
 
       // No userId or insert-by-id failed — use username path
       // Try find by username first
-      const selByName = await pool.query("SELECT id, COALESCE(username, name) AS username FROM users WHERE username = $1 OR name = $1 LIMIT 1", [username]);
+      const selByName = await pool.query(
+        "SELECT id, COALESCE(username, name) AS username FROM users WHERE username = $1 OR name = $1 LIMIT 1",
+        [username]
+      );
       if (selByName.rowCount > 0) {
         return selByName.rows[0];
       }
@@ -177,7 +209,9 @@ io.on("connection", (socket) => {
       const effectiveUsername = user.username || username || "Anon";
 
       socket.join(roomId);
-      console.log(`${effectiveUserId} joined ${roomId} as ${effectiveUsername}`);
+      console.log(
+        `${effectiveUserId} joined ${roomId} as ${effectiveUsername}`
+      );
 
       // broadcast presence to others in room
       socket.to(roomId).emit("user-joined", {
@@ -202,14 +236,8 @@ io.on("connection", (socket) => {
         roomId: r.room_id,
         senderId: r.sender_id,
         username: r.username || "Anon",
-        ciphertext:
-          r.ciphertext && typeof r.ciphertext.toString === "function"
-            ? r.ciphertext.toString("base64")
-            : r.ciphertext,
-        iv:
-          r.iv && typeof r.iv.toString === "function"
-            ? r.iv.toString("base64")
-            : r.iv,
+        ciphertext: ensureBase64Field(r.ciphertext),
+        iv: ensureBase64Field(r.iv),
         status: r.status || "sent",
         createdAt: r.created_at,
       }));
@@ -224,7 +252,15 @@ io.on("connection", (socket) => {
   // send-message: store and broadcast to others in the room (not the sender)
   socket.on(
     "send-message",
-    async ({ roomId, userId, username, ciphertext, iv, messageId, createdAt }) => {
+    async ({
+      roomId,
+      userId,
+      username,
+      ciphertext,
+      iv,
+      messageId,
+      createdAt,
+    }) => {
       try {
         // ensure user exists, get canonical id
         const user = await upsertUser({ userId, username });
@@ -252,32 +288,23 @@ io.on("connection", (socket) => {
         const insertRes = await pool.query(insertQ, insertValues);
         const row = insertRes.rows[0];
 
-        const ciphertextBase64 =
-          row.ciphertext && typeof row.ciphertext.toString === "function"
-            ? row.ciphertext.toString("base64")
-            : row.ciphertext;
-        const ivBase64 =
-          row.iv && typeof row.iv.toString === "function"
-            ? row.iv.toString("base64")
-            : row.iv;
-
-        const payload = {
+        // Build outgoing using ensureBase64Field
+        const outgoing = {
           messageId: row.message_id,
           roomId: row.room_id,
           senderId: row.sender_id,
-          username: effectiveUsername,
-          ciphertext: ciphertextBase64,
-          iv: ivBase64,
+          username: row.username || effectiveUsername,
+          ciphertext: ensureBase64Field(row.ciphertext),
+          iv: ensureBase64Field(row.iv),
           status: row.status || "sent",
           createdAt: row.created_at || new Date().toISOString(),
         };
 
-        // Broadcast to everyone in the room EXCEPT the sender — avoids duplicate on sender side
-        socket.to(roomId).emit("message", payload);
+        // Broadcast encrypted message to everyone in the room EXCEPT the sender
+        socket.to(roomId).emit("message", outgoing);
 
-        // Tell the sender the DB saved the message (full payload so client can merge/replace optimistic)
-        socket.emit("message-saved", payload);
-
+        // Notify the room (including sender) that message was saved in DB
+        io.to(roomId).emit("message-saved", outgoing);
       } catch (err) {
         console.error("send-message error", err);
         socket.emit("send-error", { error: "db error", details: err.message });
@@ -294,9 +321,17 @@ io.on("connection", (socket) => {
       );
       // emit to room only
       if (roomId) {
-        io.to(roomId).emit("message-status-update", { messageId, status: "delivered", ts: new Date().toISOString() });
+        io.to(roomId).emit("message-status-update", {
+          messageId,
+          status: "delivered",
+          ts: new Date().toISOString(),
+        });
       } else {
-        io.emit("message-status-update", { messageId, status: "delivered", ts: new Date().toISOString() });
+        io.emit("message-status-update", {
+          messageId,
+          status: "delivered",
+          ts: new Date().toISOString(),
+        });
       }
     } catch (err) {
       console.error("message-received error", err);
@@ -310,9 +345,17 @@ io.on("connection", (socket) => {
         ["read", messageId]
       );
       if (roomId) {
-        io.to(roomId).emit("message-status-update", { messageId, status: "read", ts: new Date().toISOString() });
+        io.to(roomId).emit("message-status-update", {
+          messageId,
+          status: "read",
+          ts: new Date().toISOString(),
+        });
       } else {
-        io.emit("message-status-update", { messageId, status: "read", ts: new Date().toISOString() });
+        io.emit("message-status-update", {
+          messageId,
+          status: "read",
+          ts: new Date().toISOString(),
+        });
       }
     } catch (err) {
       console.error("message-read error", err);

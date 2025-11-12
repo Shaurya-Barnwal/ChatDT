@@ -109,3 +109,13 @@ export async function exportKeyBase64(key) {
   const raw = await crypto.subtle.exportKey("raw", key);
   return toBase64(raw);
 }
+
+// compute a deterministic fingerprint from passphrase + roomId (no key export)
+export async function computeFingerprint(passphrase, roomId) {
+  // Combine passphrase and roomId with a separator to avoid accidental collisions
+  const data = textEncoder.encode(String(passphrase || "") + "|" + String(roomId || ""));
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  // digest is an ArrayBuffer — toBase64 handles ArrayBuffer
+  // Return a short, display-friendly substring (first 12 chars)
+  return toBase64(digest).slice(0, 12);
+}
