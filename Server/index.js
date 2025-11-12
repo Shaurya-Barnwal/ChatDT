@@ -44,28 +44,52 @@ const pool = new Pool({
     process.env.DATABASE_URL || "postgres://postgres:pass@localhost:5432/chat",
 });
 
-// --- add helper near top ---
-function ensureBase64Field(val) {
-  // val may be: Buffer (node), { type: 'Buffer', data: [...] } (JSONed), or already a base64 string
-  if (!val && val !== 0) return null;
-  // node Buffer
-  if (Buffer.isBuffer(val)) return val.toString("base64");
-  // Buffer-like object from JSON (e.g. { type: 'Buffer', data: [...] })
-  if (typeof val === "object" && Array.isArray(val.data))
-    return Buffer.from(val.data).toString("base64");
-  // if someone already stored base64 text -> return as-is
-  if (typeof val === "string") {
-    // optional: detect if it's hex or raw and handle — but assume base64 string if it decodes fine
-    return val;
-  }
-  // fallback: try to stringify
+// ----------------- Helpers -----------------
+
+// convert buffers/bytea-like values to base64 string
+function bufferToBase64(buf) {
+  if (buf === null || buf === undefined) return null;
+  if (typeof buf === "string") return buf;
+  if (Buffer.isBuffer(buf)) return buf.toString("base64");
+  if (typeof buf === "object" && Array.isArray(buf.data))
+    return Buffer.from(buf.data).toString("base64");
   try {
-    return Buffer.from(JSON.stringify(val)).toString("base64");
+    return Buffer.from(JSON.stringify(buf)).toString("base64");
   } catch (e) {
     return null;
   }
 }
-// --- end helper ---
+
+// normalize a DB row (snake_case or camelCase) into the shape the client expects
+function normalizeMessageRow(row) {
+  const messageId =
+    row.message_id || row.messageId || row.id || row.messageId || null;
+  const roomId = row.room_id || row.roomId || row.room || null;
+  const senderId =
+    row.sender_id || row.senderId || row.sender || row.user_id || null;
+  const username = row.username || row.name || row.user_name || "Anon";
+
+  const iv = bufferToBase64(row.iv);
+  const ciphertext = bufferToBase64(row.ciphertext || row.body || row.ct);
+
+  const createdAt =
+    row.created_at || row.createdAt || row.created || new Date().toISOString();
+
+  return {
+    messageId,
+    roomId,
+    senderId,
+    username,
+    iv,
+    ciphertext,
+    createdAt,
+    status: row.status || "sent",
+    deliveredAt: row.delivered_at || row.deliveredAt || null,
+    readAt: row.read_at || row.readAt || null,
+  };
+}
+
+// ----------------- End helpers -----------------
 
 // health
 app.get("/", (req, res) => {
@@ -76,7 +100,6 @@ app.get("/", (req, res) => {
 app.post("/create-room", async (req, res) => {
   const { room_name } = req.body;
   try {
-    // assuming rooms.id is UUID or serial and returns `id`
     const result = await pool.query(
       "INSERT INTO rooms(room_name) VALUES($1) RETURNING id",
       [room_name || null]
@@ -104,19 +127,7 @@ app.get("/rooms/:roomId/messages", async (req, res) => {
     `;
     const result = await pool.query(q, [roomId]);
 
-    const rows = result.rows.map((r) => ({
-      messageId: r.message_id,
-      roomId: r.room_id,
-      senderId: r.sender_id,
-      username: r.username || "Anon",
-      // use helper to ensure base64 string
-      ciphertext: ensureBase64Field(r.ciphertext),
-      iv: ensureBase64Field(r.iv),
-      status: r.status,
-      deliveredAt: r.delivered_at,
-      readAt: r.read_at,
-      createdAt: r.created_at,
-    }));
+    const rows = result.rows.map(normalizeMessageRow);
 
     res.json(rows);
   } catch (err) {
@@ -132,9 +143,6 @@ io.on("connection", (socket) => {
   async function upsertUser({ userId, username }) {
     username = (username || "Anon").trim();
 
-    // Defensive approach:
-    // - If userId provided: try to find by id. If exists -> optionally update username. If not -> try to insert with that id.
-    // - If only username provided: try to find existing row, otherwise insert.
     try {
       if (userId) {
         // Try find by id first
@@ -160,7 +168,7 @@ io.on("connection", (socket) => {
           }
           return { id: existing.id, username: username || existing.username };
         } else {
-          // Insert with provided id. If schema uses UUID and forbids client-provided id this will fail; handle conflict below.
+          // Insert with provided id. If schema forbids client-provided id this may fail; handle conflict below.
           try {
             const ins = await pool.query(
               "INSERT INTO users (id, username) VALUES ($1, $2) RETURNING id, COALESCE(username, name) AS username",
@@ -178,7 +186,6 @@ io.on("connection", (socket) => {
       }
 
       // No userId or insert-by-id failed — use username path
-      // Try find by username first
       const selByName = await pool.query(
         "SELECT id, COALESCE(username, name) AS username FROM users WHERE username = $1 OR name = $1 LIMIT 1",
         [username]
@@ -231,16 +238,7 @@ io.on("connection", (socket) => {
       `;
       const resRows = await pool.query(q, [roomId]);
 
-      const normalized = resRows.rows.map((r) => ({
-        messageId: r.message_id,
-        roomId: r.room_id,
-        senderId: r.sender_id,
-        username: r.username || "Anon",
-        ciphertext: ensureBase64Field(r.ciphertext),
-        iv: ensureBase64Field(r.iv),
-        status: r.status || "sent",
-        createdAt: r.created_at,
-      }));
+      const normalized = resRows.rows.map(normalizeMessageRow);
 
       socket.emit("recent-messages", normalized);
     } catch (err) {
@@ -288,23 +286,15 @@ io.on("connection", (socket) => {
         const insertRes = await pool.query(insertQ, insertValues);
         const row = insertRes.rows[0];
 
-        // Build outgoing using ensureBase64Field
-        const outgoing = {
-          messageId: row.message_id,
-          roomId: row.room_id,
-          senderId: row.sender_id,
-          username: row.username || effectiveUsername,
-          ciphertext: ensureBase64Field(row.ciphertext),
-          iv: ensureBase64Field(row.iv),
-          status: row.status || "sent",
-          createdAt: row.created_at || new Date().toISOString(),
-        };
+        // normalize payload and ensure username is present
+        const payload = normalizeMessageRow(row);
+        payload.username = payload.username || effectiveUsername;
 
         // Broadcast encrypted message to everyone in the room EXCEPT the sender
-        socket.to(roomId).emit("message", outgoing);
+        socket.to(roomId).emit("message", payload);
 
         // Notify the room (including sender) that message was saved in DB
-        io.to(roomId).emit("message-saved", outgoing);
+        io.to(roomId).emit("message-saved", payload);
       } catch (err) {
         console.error("send-message error", err);
         socket.emit("send-error", { error: "db error", details: err.message });
